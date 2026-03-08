@@ -1,0 +1,847 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const crypto = require('crypto');
+const fs = require('fs');
+const https = require('https');
+const db = require('./db');
+
+const app = express();
+
+// Configure CORS for web builds - allow all origins in development
+const corsOptions = {
+  origin: true, // Allow all origins
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
+};
+
+app.use(cors(corsOptions));
+
+// Log CORS handling for debugging
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    console.log(`[cors] Handling OPTIONS preflight from ${req.ip} for ${req.path}`);
+  }
+  next();
+});
+
+// Increased limit to handle larger sync payloads
+// Can be overridden with BODY_PARSER_LIMIT env var (e.g., '10mb', '50mb')
+const bodyLimit = process.env.BODY_PARSER_LIMIT || '50mb';
+app.use(bodyParser.json({ limit: bodyLimit }));
+
+// Mapping tables to conflict target columns for upsert
+const tableConflictTargets = {
+  bet_logs: ['league_id', 'game_id', 'period', 'trigger'],
+  user_bets: ['id'],
+  elo_ratings: ['league_id', 'team_id'],
+  team_stats: ['league_id', 'team_id'],
+  game_odds: ['league_id', 'game_id'],
+  trigger_alerts: ['league_id', 'game_id', 'period', 'trigger'],
+  cached_games: ['league_id', 'game_id'],
+  ml_models: ['league_id', 'model_name'],
+};
+
+// NOTE: Removed a trivial /health handler that returned a static OK.
+// The detailed DB-aware /health handler later in the file performs an actual
+// PostgreSQL probe (SELECT 1) and reports 'db: available' or 'unavailable'.
+// Keeping only the DB-aware handler ensures health checks reflect DB state.
+
+// Fields that should be treated as timestamps
+const timestampFields = [
+  'created_at',
+  'graded_at',
+  'last_updated',
+  'captured_at',
+  'result_logged_at',
+  'timestamp',
+];
+
+// Convert Unix timestamp (seconds or milliseconds) to Date object
+function convertTimestamp(val) {
+  if (!val) return null;
+  if (val instanceof Date) return val;
+  if (typeof val === 'string') {
+    // Try parsing as ISO string first
+    const d = new Date(val);
+    if (!isNaN(d.getTime())) return d;
+  }
+  if (typeof val === 'number') {
+    // If it looks like seconds (before year 3000), multiply by 1000
+    // Unix timestamps in seconds are ~10 digits, milliseconds are ~13 digits
+    if (val < 100000000000) {
+      return new Date(val * 1000);
+    }
+    return new Date(val);
+  }
+  return null;
+}
+
+// Derive a primary key string from payload based on table's conflict targets.
+// Used by /sync/batch where the client may not send an explicit `pk`.
+function derivePkFromPayload(table, payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const targets = tableConflictTargets[table];
+  // user_bets syncs on uuid, not autoincrement id
+  if (table === 'user_bets' && payload.uuid) return payload.uuid;
+  if (!targets) {
+    return payload.id != null ? String(payload.id) : null;
+  }
+  if (targets.length === 1) {
+    const val = payload[targets[0]];
+    return val != null ? String(val) : null;
+  }
+  // Composite key: build JSON object
+  const pkObj = {};
+  for (const col of targets) {
+    pkObj[col] = payload[col];
+  }
+  return JSON.stringify(pkObj);
+}
+
+function buildUpsertQuery(table, payload, conflictCols) {
+  // Convert timestamp fields before building query
+  const processedPayload = { ...payload };
+  for (const field of timestampFields) {
+    if (field in processedPayload) {
+      processedPayload[field] = convertTimestamp(processedPayload[field]);
+    }
+  }
+
+  const cols = Object.keys(processedPayload);
+  const vals = cols.map((_, i) => `$${i + 1}`);
+  const set = cols.map((c) => `${c} = EXCLUDED.${c}`).join(', ');
+  const sql = `INSERT INTO ${table}(${cols.join(',')}) VALUES(${vals.join(',')}) ON CONFLICT(${conflictCols.join(',')}) DO UPDATE SET ${set}`;
+  return { sql, params: cols.map((c) => processedPayload[c]) };
+}
+
+function parseTs(val) {
+  if (!val) return null;
+  const d = new Date(val);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+async function simulateChangeWithRules(client, ch) {
+  const { change_id, table, pk, op, payload } = ch;
+
+  if (op === 'delete') {
+    // If delete would remove an existing row, report wouldApply=true
+    let pkObj = null;
+    try {
+      pkObj = JSON.parse(pk);
+    } catch (e) {}
+
+    if (pkObj && typeof pkObj === 'object') {
+      const whereClauses = Object.keys(pkObj).map((k, i) => `${k} = $${i + 1}`);
+      const params = Object.keys(pkObj).map((k) => pkObj[k]);
+      const r = await client.query(
+        `SELECT 1 FROM ${table} WHERE ${whereClauses.join(' AND ')}`,
+        params
+      );
+      return { wouldApply: r.rowCount > 0, reason: r.rowCount > 0 ? 'exists' : 'not_found' };
+    } else {
+      const r = await client.query(`SELECT 1 FROM ${table} WHERE id = $1`, [pk]);
+      return { wouldApply: r.rowCount > 0, reason: r.rowCount > 0 ? 'exists' : 'not_found' };
+    }
+  }
+
+  // Per-table simulation rules
+  switch (table) {
+    case 'elo_ratings': {
+      const league = payload.league_id;
+      const team = payload.team_id;
+      const incomingTs = parseTs(payload.last_updated);
+      const existing = await client.query(
+        'SELECT elo, last_updated FROM elo_ratings WHERE league_id=$1 AND team_id=$2',
+        [league, team]
+      );
+      if (existing.rowCount === 0) return { wouldApply: true, reason: 'insert' };
+      const existingTs = parseTs(existing.rows[0].last_updated);
+      if (incomingTs && (!existingTs || incomingTs > existingTs))
+        return { wouldApply: true, reason: 'newer' };
+      return { wouldApply: false, reason: 'stale' };
+    }
+
+    case 'team_stats': {
+      const league = payload.league_id;
+      const team = payload.team_id;
+      const existing = await client.query(
+        'SELECT games_analyzed, last_updated FROM team_stats WHERE league_id=$1 AND team_id=$2',
+        [league, team]
+      );
+      if (existing.rowCount === 0) return { wouldApply: true, reason: 'insert' };
+      const incomingGames = payload.games_analyzed || 0;
+      const existingGames = existing.rows[0].games_analyzed || 0;
+      if (incomingGames > existingGames) return { wouldApply: true, reason: 'richer' };
+      const incomingTs = parseTs(payload.last_updated);
+      const existingTs = parseTs(existing.rows[0].last_updated);
+      if (incomingTs && (!existingTs || incomingTs > existingTs))
+        return { wouldApply: true, reason: 'newer' };
+      return { wouldApply: false, reason: 'stale_or_lower_info' };
+    }
+
+    case 'game_odds': {
+      const league = payload.league_id;
+      const gameId = payload.game_id;
+      const existing = await client.query(
+        'SELECT total_line, last_updated FROM game_odds WHERE league_id=$1 AND game_id=$2',
+        [league, gameId]
+      );
+      if (existing.rowCount === 0) return { wouldApply: true, reason: 'insert' };
+      if (payload.total_line != null && payload.total_line !== existing.rows[0].total_line)
+        return { wouldApply: true, reason: 'total_line_change' };
+      const incomingTs = parseTs(payload.last_updated);
+      const existingTs = parseTs(existing.rows[0].last_updated);
+      if (incomingTs && (!existingTs || incomingTs > existingTs))
+        return { wouldApply: true, reason: 'newer' };
+      return { wouldApply: false, reason: 'stale_or_no_change' };
+    }
+
+    case 'bet_logs': {
+      let pkObj = null;
+      try {
+        pkObj = JSON.parse(pk);
+      } catch (e) {}
+      if (!pkObj) return { wouldApply: false, reason: 'invalid_pk' };
+      const { league_id, game_id, period, trigger } = pkObj;
+      const existing = await client.query(
+        'SELECT result, result_logged_at FROM bet_logs WHERE league_id=$1 AND game_id=$2 AND period=$3 AND trigger=$4',
+        [league_id, game_id, period, trigger]
+      );
+      if (existing.rowCount === 0) return { wouldApply: true, reason: 'insert' };
+      const incomingResult = payload.result;
+      const incomingResultLoggedAt = parseTs(payload.result_logged_at);
+      const existingResultLoggedAt = parseTs(existing.rows[0].result_logged_at);
+      if (incomingResult != null) {
+        if (
+          existing.rows[0].result == null ||
+          (incomingResultLoggedAt &&
+            (!existingResultLoggedAt || incomingResultLoggedAt > existingResultLoggedAt))
+        ) {
+          return { wouldApply: true, reason: 'new_result' };
+        }
+      }
+      return { wouldApply: false, reason: 'no_significant_change' };
+    }
+
+    case 'user_bets': {
+      // Use uuid for cross-device sync (uuid is unique across all devices)
+      const uuid = payload.uuid || pk;
+      const existing = await client.query('SELECT graded_at FROM user_bets WHERE uuid=$1', [uuid]);
+      if (existing.rowCount === 0) return { wouldApply: true, reason: 'insert' };
+      const incomingGraded = parseTs(payload.graded_at);
+      const existingGraded = parseTs(existing.rows[0].graded_at);
+      if (incomingGraded && (!existingGraded || incomingGraded > existingGraded))
+        return { wouldApply: true, reason: 'newer_grade' };
+      return { wouldApply: false, reason: 'stale' };
+    }
+
+    case 'trigger_alerts': {
+      const pkObj = JSON.parse(pk);
+      const { league_id, game_id, period, trigger } = pkObj;
+      const existing = await client.query(
+        'SELECT timestamp, probability, is_best FROM trigger_alerts WHERE league_id=$1 AND game_id=$2 AND period=$3 AND trigger=$4',
+        [league_id, game_id, period, trigger]
+      );
+      if (existing.rowCount === 0) return { wouldApply: true, reason: 'insert' };
+      const incomingTs = parseTs(payload.timestamp);
+      const existingTs = parseTs(existing.rows[0].timestamp);
+      const existingIsBest = existing.rows[0].is_best === true;
+      const incomingIsBest = payload.is_best === true;
+      if (incomingIsBest && !existingIsBest) return { wouldApply: true, reason: 'best_replace' };
+      if (incomingIsBest && existingIsBest) {
+        if ((payload.probability || 0) > (existing.rows[0].probability || 0))
+          return { wouldApply: true, reason: 'higher_probability' };
+        return { wouldApply: false, reason: 'lower_probability' };
+      }
+      if (incomingTs && (!existingTs || incomingTs > existingTs))
+        return { wouldApply: true, reason: 'newer' };
+      return { wouldApply: false, reason: 'stale' };
+    }
+
+    case 'ml_models': {
+      const { league_id, model_name } = payload;
+      const existing = await client.query(
+        'SELECT updated_at FROM ml_models WHERE league_id=$1 AND model_name=$2',
+        [league_id, model_name]
+      );
+      if (existing.rowCount === 0) return { wouldApply: true, reason: 'insert' };
+      const incomingTs = parseTs(payload.updated_at);
+      const existingTs = parseTs(existing.rows[0].updated_at);
+      if (incomingTs && (!existingTs || incomingTs > existingTs))
+        return { wouldApply: true, reason: 'newer' };
+      return { wouldApply: false, reason: 'stale' };
+    }
+
+    default: {
+      // conservative: if row missing or payload has id not matching existing, report apply
+      try {
+        const pkObj = pk && pk.startsWith('{') ? JSON.parse(pk) : null;
+        if (pkObj) {
+          const where = Object.keys(pkObj)
+            .map((k) => `${k} = $${Object.keys(pkObj).indexOf(k) + 1}`)
+            .join(' AND ');
+          const params = Object.keys(pkObj).map((k) => pkObj[k]);
+          const r = await client.query(`SELECT 1 FROM ${table} WHERE ${where}`, params);
+          return { wouldApply: r.rowCount === 0, reason: r.rowCount === 0 ? 'insert' : 'exists' };
+        }
+        if (payload && payload.id != null) {
+          const r = await client.query(`SELECT 1 FROM ${table} WHERE id = $1`, [payload.id]);
+          return { wouldApply: r.rowCount === 0, reason: r.rowCount === 0 ? 'insert' : 'exists' };
+        }
+      } catch (e) {
+        return { wouldApply: true, reason: 'unknown' };
+      }
+      return { wouldApply: true, reason: 'unknown' };
+    }
+  }
+}
+
+async function applyChangeWithRules(client, ch) {
+  const { change_id, table, pk, op, payload } = ch;
+
+  // Idempotency check
+  const r = await client.query('SELECT 1 FROM applied_changes WHERE change_id = $1', [change_id]);
+  if (r.rowCount > 0) return { applied: false, reason: 'already_applied' };
+
+  if (op === 'delete') {
+    let pkObj = null;
+    try {
+      pkObj = JSON.parse(pk);
+    } catch (e) {}
+
+    if (pkObj && typeof pkObj === 'object') {
+      const whereClauses = Object.keys(pkObj).map((k, i) => `${k} = $${i + 1}`);
+      const params = Object.keys(pkObj).map((k) => pkObj[k]);
+      await client.query(`DELETE FROM ${table} WHERE ${whereClauses.join(' AND ')}`, params);
+      return { applied: true };
+    } else {
+      await client.query(`DELETE FROM ${table} WHERE id = $1`, [pk]);
+      return { applied: true };
+    }
+  }
+
+  // Per-table conflict resolution
+  switch (table) {
+    case 'elo_ratings': {
+      // Use last_updated timestamp to decide
+      const league = payload.league_id;
+      const team = payload.team_id;
+      const incomingTs = parseTs(payload.last_updated);
+      const existing = await client.query(
+        'SELECT elo, last_updated FROM elo_ratings WHERE league_id=$1 AND team_id=$2',
+        [league, team]
+      );
+      if (existing.rowCount === 0) {
+        // insert
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'team_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      const existingTs = parseTs(existing.rows[0].last_updated);
+      if (incomingTs && (!existingTs || incomingTs > existingTs)) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'team_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      // ignore older or equal
+      return { applied: false, reason: 'stale' };
+    }
+
+    case 'team_stats': {
+      const league = payload.league_id;
+      const team = payload.team_id;
+      const incomingTs = parseTs(payload.last_updated);
+      const existing = await client.query(
+        'SELECT games_analyzed, wins, losses, ppg, period_avg, last_updated FROM team_stats WHERE league_id=$1 AND team_id=$2',
+        [league, team]
+      );
+      if (existing.rowCount === 0) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'team_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      const existingRow = existing.rows[0];
+      const existingTs = parseTs(existingRow.last_updated);
+
+      // Field-level merge: if incoming has higher games_analyzed, prefer its aggregate fields
+      const incomingGames = payload.games_analyzed || 0;
+      const existingGames = existingRow.games_analyzed || 0;
+      if (incomingGames > existingGames) {
+        const merged = Object.assign({}, existingRow, payload);
+        const { sql, params } = buildUpsertQuery(table, merged, ['league_id', 'team_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+
+      // Otherwise, use timestamp if provided
+      if (incomingTs && (!existingTs || incomingTs > existingTs)) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'team_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      return { applied: false, reason: 'stale_or_lower_info' };
+    }
+
+    case 'game_odds': {
+      const league = payload.league_id;
+      const gameId = payload.game_id;
+      const incomingTs = parseTs(payload.last_updated);
+      const existing = await client.query(
+        'SELECT last_updated, total_line FROM game_odds WHERE league_id=$1 AND game_id=$2',
+        [league, gameId]
+      );
+      if (existing.rowCount === 0) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'game_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      const existingRow = existing.rows[0];
+      const existingTs = parseTs(existingRow.last_updated);
+
+      // Field-level merge example: if payload has total_line and it's different, prefer the latest non-null total_line
+      if (payload.total_line != null && payload.total_line !== existingRow.total_line) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'game_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+
+      if (incomingTs && (!existingTs || incomingTs > existingTs)) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'game_id']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      return { applied: false, reason: 'stale_or_no_change' };
+    }
+
+    case 'bet_logs': {
+      // Insert if not exists. If exists, prefer updates that include 'result' or later result_logged_at.
+      let pkObj = null;
+      try {
+        pkObj = JSON.parse(pk);
+      } catch (e) {}
+      if (!pkObj) return { applied: false, reason: 'invalid_pk' };
+      const { league_id, game_id, period, trigger } = pkObj;
+      const existing = await client.query(
+        'SELECT result, result_logged_at, captured_at FROM bet_logs WHERE league_id=$1 AND game_id=$2 AND period=$3 AND trigger=$4',
+        [league_id, game_id, period, trigger]
+      );
+      if (existing.rowCount === 0) {
+        const { sql, params } = buildUpsertQuery(table, payload, [
+          'league_id',
+          'game_id',
+          'period',
+          'trigger',
+        ]);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+
+      // if incoming has result and either existing result is null or incoming result_logged_at is newer
+      const incomingResult = payload.result;
+      const incomingResultLoggedAt = parseTs(payload.result_logged_at);
+      const existingResult = existing.rows[0].result;
+      const existingResultLoggedAt = parseTs(existing.rows[0].result_logged_at);
+
+      if (incomingResult != null) {
+        if (
+          existingResult == null ||
+          (incomingResultLoggedAt &&
+            (!existingResultLoggedAt || incomingResultLoggedAt > existingResultLoggedAt))
+        ) {
+          const { sql, params } = buildUpsertQuery(table, payload, [
+            'league_id',
+            'game_id',
+            'period',
+            'trigger',
+          ]);
+          await client.query(sql, params);
+          return { applied: true };
+        }
+      }
+
+      // Otherwise ignore
+      return { applied: false, reason: 'no_significant_change' };
+    }
+
+    case 'user_bets': {
+      // Use uuid for cross-device sync (uuid is unique across all devices)
+      const uuid = payload.uuid || pk;
+      const existing = await client.query('SELECT graded_at FROM user_bets WHERE uuid=$1', [uuid]);
+      if (existing.rowCount === 0) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['uuid']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      const incomingGraded = parseTs(payload.graded_at);
+      const existingGraded = parseTs(existing.rows[0].graded_at);
+      if (incomingGraded && (!existingGraded || incomingGraded > existingGraded)) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['uuid']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      return { applied: false, reason: 'stale' };
+    }
+
+    case 'trigger_alerts': {
+      // Prefer newer timestamp for alerts
+      const pkObj = JSON.parse(pk);
+      const { league_id, game_id, period, trigger } = pkObj;
+      const existing = await client.query(
+        'SELECT timestamp, probability, is_best FROM trigger_alerts WHERE league_id=$1 AND game_id=$2 AND period=$3 AND trigger=$4',
+        [league_id, game_id, period, trigger]
+      );
+      const incomingTs = parseTs(payload.timestamp);
+      if (existing.rowCount === 0) {
+        const { sql, params } = buildUpsertQuery(table, payload, [
+          'league_id',
+          'game_id',
+          'period',
+          'trigger',
+        ]);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      const existingTs = parseTs(existing.rows[0].timestamp);
+      const existingIsBest = existing.rows[0].is_best === true;
+      const incomingIsBest = payload.is_best === true;
+
+      // If incoming is a Best entry and existing isn't, replace. If both are Best prefer higher probability.
+      if (incomingIsBest && !existingIsBest) {
+        const { sql, params } = buildUpsertQuery(table, payload, [
+          'league_id',
+          'game_id',
+          'period',
+          'trigger',
+        ]);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      if (incomingIsBest && existingIsBest) {
+        if ((payload.probability || 0) > (existing.rows[0].probability || 0)) {
+          const { sql, params } = buildUpsertQuery(table, payload, [
+            'league_id',
+            'game_id',
+            'period',
+            'trigger',
+          ]);
+          await client.query(sql, params);
+          return { applied: true };
+        }
+        return { applied: false, reason: 'lower_probability' };
+      }
+
+      if (incomingTs && (!existingTs || incomingTs > existingTs)) {
+        const { sql, params } = buildUpsertQuery(table, payload, [
+          'league_id',
+          'game_id',
+          'period',
+          'trigger',
+        ]);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      return { applied: false, reason: 'stale' };
+    }
+
+    case 'ml_models': {
+      const { league_id, model_name } = payload;
+      const incomingTs = parseTs(payload.updated_at);
+      const existing = await client.query(
+        'SELECT updated_at FROM ml_models WHERE league_id=$1 AND model_name=$2',
+        [league_id, model_name]
+      );
+      if (
+        existing.rowCount === 0 ||
+        !existing.rows[0].updated_at ||
+        (incomingTs && incomingTs > parseTs(existing.rows[0].updated_at))
+      ) {
+        const { sql, params } = buildUpsertQuery(table, payload, ['league_id', 'model_name']);
+        await client.query(sql, params);
+        return { applied: true };
+      }
+      return { applied: false, reason: 'stale' };
+    }
+
+    default: {
+      // Generic upsert
+      const conflictCols = tableConflictTargets[table] || ['id'];
+      const { sql, params } = buildUpsertQuery(table, payload, conflictCols);
+      await client.query(sql, params);
+      return { applied: true };
+    }
+  }
+}
+
+function requireAuth(req, res, next) {
+  const token = process.env.SYNC_API_TOKEN;
+  // If no token configured, allow anonymous access (dev mode). Otherwise require Bearer token.
+  if (!token) return next();
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+  const provided = auth.split(' ')[1];
+  if (provided !== token) return res.status(401).json({ error: 'unauthorized' });
+  return next();
+}
+
+app.post('/sync', requireAuth, async (req, res) => {
+  console.log(
+    `[sync] Received POST /sync from ${req.ip} with ${req.body.changes?.length || 0} changes`
+  );
+  const { device_id, last_server_seq = 0, changes = [] } = req.body;
+
+  let client = null;
+  try {
+    client = await db.getClient();
+    await client.query('BEGIN');
+
+    for (const ch of changes) {
+      const { change_id } = ch;
+      const result = await applyChangeWithRules(client, ch);
+
+      // Record applied_changes regardless to guarantee idempotency across repeated syncs
+      await client.query(
+        'INSERT INTO applied_changes(change_id) VALUES($1) ON CONFLICT (change_id) DO NOTHING',
+        [change_id]
+      );
+
+      // If actually applied, insert into server_changes so other clients can pick it up
+      if (result.applied) {
+        await client.query(
+          'INSERT INTO server_changes(table_name, pk, op, payload, change_id) VALUES($1,$2,$3,$4,$5)',
+          [ch.table, ch.pk, ch.op, ch.payload ? JSON.stringify(ch.payload) : null, change_id]
+        );
+      }
+    }
+
+    // fetch server changes since last_server_seq (paginated)
+    const pullLimit = Math.min(Math.max(parseInt(req.body.pull_limit) || 500, 1), 50000);
+    const srv = await client.query(
+      'SELECT server_seq, table_name, pk, op, payload, change_id FROM server_changes WHERE server_seq > $1 ORDER BY server_seq ASC LIMIT $2',
+      [last_server_seq, pullLimit]
+    );
+    await client.query('COMMIT');
+
+    const hasMore = srv.rows.length === pullLimit;
+    res.json({
+      applied: changes.map((c) => c.change_id),
+      server_changes: srv.rows,
+      new_server_seq: srv.rows.length ? srv.rows[srv.rows.length - 1].server_seq : last_server_seq,
+      has_more: hasMore,
+    });
+  } catch (err) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (e) {
+        /* ignore rollback errors */
+      }
+    }
+    console.error('Sync failed', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (client) {
+      try {
+        client.release();
+      } catch (e) {
+        /* ignore release errors */
+      }
+    }
+  }
+});
+
+// Dry-run endpoint: simulate applying changes without persisting
+app.post('/sync/dryrun', requireAuth, async (req, res) => {
+  const { changes = [] } = req.body;
+  let client = null;
+  try {
+    client = await db.getClient();
+    const results = [];
+    for (const ch of changes) {
+      const sim = await simulateChangeWithRules(client, ch);
+      results.push({
+        change_id: ch.change_id,
+        table: ch.table,
+        would_apply: sim.wouldApply,
+        reason: sim.reason,
+      });
+    }
+    res.json({ results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (client) {
+      try {
+        client.release();
+      } catch (e) {
+        /* ignore release errors */
+      }
+    }
+  }
+});
+
+// Batch sync endpoint: accepts the { operations: [...] } format used by the
+// client's count-based batching path and 404-fallback path.
+app.post('/sync/batch', requireAuth, async (req, res) => {
+  const { operations = [] } = req.body;
+  console.log(
+    `[sync/batch] Received POST /sync/batch from ${req.ip} with ${operations.length} operations`
+  );
+
+  let client = null;
+  try {
+    client = await db.getClient();
+    await client.query('BEGIN');
+
+    const results = [];
+
+    for (const op of operations) {
+      const table = op.table;
+      const opType = (op.operation || 'INSERT').toLowerCase();
+      const payload = op.data || {};
+      const changeId = op.change_id || crypto.randomUUID();
+      const pk = op.pk || derivePkFromPayload(table, payload);
+
+      const ch = { change_id: changeId, table, pk, op: opType, payload };
+      const result = await applyChangeWithRules(client, ch);
+
+      await client.query(
+        'INSERT INTO applied_changes(change_id) VALUES($1) ON CONFLICT (change_id) DO NOTHING',
+        [changeId]
+      );
+
+      if (result.applied) {
+        await client.query(
+          'INSERT INTO server_changes(table_name, pk, op, payload, change_id) VALUES($1,$2,$3,$4,$5)',
+          [table, pk, opType, JSON.stringify(payload), changeId]
+        );
+      }
+
+      results.push({
+        change_id: changeId,
+        table,
+        applied: result.applied,
+        reason: result.reason || null,
+      });
+    }
+
+    // Get latest server_seq for response
+    const seqResult = await client.query('SELECT MAX(server_seq) as max_seq FROM server_changes');
+    const newServerSeq = seqResult.rows[0]?.max_seq || 0;
+
+    await client.query('COMMIT');
+
+    res.json({
+      results,
+      new_server_seq: newServerSeq,
+    });
+  } catch (err) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    console.error('Batch sync failed', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (client) {
+      try {
+        client.release();
+      } catch (e) {
+        /* ignore */
+      }
+    }
+  }
+});
+
+const port = process.env.PORT || 8081;
+const host = process.env.HOST || '0.0.0.0';
+// Health endpoint for basic checks
+app.get('/health', async (req, res) => {
+  try {
+    const r = await db.query('SELECT 1');
+    const dbStatus = r && typeof r.rowCount === 'number' ? 'available' : 'unavailable';
+    res.json({ status: 'ok', db: dbStatus });
+  } catch (e) {
+    res.json({ status: 'ok', db: 'unavailable', error: e.message });
+  }
+});
+
+// Alternative health endpoint (used by some clients)
+app.get('/_health', async (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+(async () => {
+  const sslCert = process.env.SSL_CERT_PATH;
+  const sslKey = process.env.SSL_KEY_PATH;
+  const port = process.env.PORT || 8081;
+  const host = process.env.HOST || '0.0.0.0';
+
+  // Helper to print start info
+  async function printStartupInfo(listenUrl) {
+    console.log('');
+    console.log('========================================');
+    console.log('  SYNC SERVER WITH POSTGRESQL');
+    console.log('========================================');
+    console.log('');
+    console.log(`Server URL: ${listenUrl}`);
+
+    // Test database connection
+    try {
+      const r = await db.query('SELECT 1');
+      if (r && typeof r.rowCount === 'number') {
+        console.log('Database:   PostgreSQL ✓ CONNECTED');
+        console.log(`Connection: ${process.env.DATABASE_URL || 'localhost:5432/elite_bet_sync'}`);
+      } else {
+        console.log('Database:   In-memory mode (PostgreSQL unavailable)');
+      }
+    } catch (e) {
+      console.log('Database:   In-memory mode (PostgreSQL error:', e.message + ')');
+    }
+
+    console.log('');
+    if (host === '0.0.0.0') {
+      const proto = listenUrl.startsWith('https') ? 'https' : 'http';
+      console.log('Accessible from:');
+      console.log(`  - Local:   ${proto}://localhost:${port}`);
+      console.log(`  - Network: ${proto}://<your-ip>:${port}`);
+    }
+    console.log('');
+    console.log('Endpoints:');
+    console.log('  POST /sync        - Main sync');
+    console.log('  POST /sync/batch  - Batch sync');
+    console.log('  GET  /health      - Health check');
+    console.log('');
+    console.log('Data is PERSISTENT (stored in PostgreSQL)');
+    console.log('');
+    console.log('Server ready! ✅');
+    console.log('========================================');
+    console.log('');
+  }
+
+  if (sslCert && sslKey) {
+    // Start HTTPS server
+    try {
+      const cert = fs.readFileSync(sslCert);
+      const key = fs.readFileSync(sslKey);
+      const httpsServer = https.createServer({ key, cert }, app);
+      httpsServer.listen(port, host, async () => {
+        await printStartupInfo(`https://${host === '0.0.0.0' ? 'localhost' : host}:${port}`);
+      });
+      return;
+    } catch (e) {
+      console.error('Failed to start HTTPS server, falling back to HTTP:', e.message);
+    }
+  }
+
+  // Fall back to HTTP
+  app.listen(port, host, async () => {
+    await printStartupInfo(`http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`);
+  });
+})();
+
+module.exports = app;

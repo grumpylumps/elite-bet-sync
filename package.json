@@ -1,0 +1,24 @@
+{
+  "name": "elite-bet-sync-prototype",
+  "version": "0.1.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js",
+    "test": "jest",
+    "migrate": "node migrations/run_migrations.js",
+    "test:e2e": "docker-compose up -d && sleep 5 && npm run migrate && jest --runInBand && docker-compose down",
+    "test:smoke": "docker-compose up -d && sleep 5 && npm run migrate && jest test/smoke.test.js --runInBand && docker-compose down",
+    "test:smoke:ci": "node migrations/run_migrations.js && jest test/smoke.test.js --runInBand"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "pg": "^8.10.0",
+    "body-parser": "^1.20.2"
+  },
+  "devDependencies": {
+    "jest": "^29.6.1",
+    "supertest": "^6.3.3"
+  }
+}
