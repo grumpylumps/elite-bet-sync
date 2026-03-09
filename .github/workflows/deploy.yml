@@ -52,7 +52,9 @@ jobs:
         run: npm ci
 
       - name: Run database migrations
-        run: node migrations/run_migrations.js
+        run: |
+          DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}" \
+            node migrations/run_migrations.js
 
       - name: Run tests
         run: npm test -- --runInBand --forceExit
