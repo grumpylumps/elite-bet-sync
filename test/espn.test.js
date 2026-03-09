@@ -96,18 +96,21 @@ describe('ESPN proxy — scoreboard', () => {
   });
 
   test('serves response from cache on second request', async () => {
+    // Use a DIFFERENT date so the previous test's cache entry doesn't interfere
+    const CACHE_DATE = '20200102';
     const mockData = { events: [{ id: '401234', name: 'Cached Game' }] };
+
     // First call — cache miss, populates cache
     mockEspnResponse(mockData);
-    await request(app).get(`/espn/nba/scoreboard?date=${TEST_DATE}`);
+    await request(app).get(`/espn/nba/scoreboard?date=${CACHE_DATE}`);
     jest.restoreAllMocks();
 
-    // Second call — should be served from cache without hitting ESPN
-    const spy = mockEspnResponse({ events: [] }); // different data; should NOT be used
-    const res = await request(app).get(`/espn/nba/scoreboard?date=${TEST_DATE}`);
+    // Second call — must be served from cache, not from ESPN
+    const spy = mockEspnResponse({ events: [] }); // different data — must NOT be used
+    const res = await request(app).get(`/espn/nba/scoreboard?date=${CACHE_DATE}`);
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(mockData); // still the cached data
+    expect(res.body).toEqual(mockData); // still the first cached response
     expect(spy).not.toHaveBeenCalled();
   });
 
@@ -166,15 +169,18 @@ describe('ESPN proxy — game odds', () => {
 
 describe('ESPN proxy — SSE stream', () => {
   test('valid league returns event-stream content-type', (done) => {
-    const req = request(app).get('/espn/nba/stream');
+    const req = request(app).get('/espn/nba/stream').buffer(false);
 
     req.on('response', (res) => {
-      expect(res.status).toBe(200);
+      expect(res.statusCode).toBe(200);
       expect(res.headers['content-type']).toMatch(/text\/event-stream/);
-      req.abort(); // close connection so test does not hang
+      res.destroy(); // close stream immediately
       done();
     });
 
+    // res.destroy() causes a socket hang-up error — ignore it
+    req.on('error', () => {});
+
     req.end();
-  });
+  }, 10000);
 });

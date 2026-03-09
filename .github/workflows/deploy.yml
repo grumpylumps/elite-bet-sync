@@ -57,7 +57,7 @@ jobs:
             node migrations/run_migrations.js
 
       - name: Run tests
-        run: npm test -- --runInBand --forceExit
+        run: npm test -- --forceExit
 
   deploy:
     name: Build, Push & Deploy to ECS
