@@ -775,7 +775,255 @@ app.get('/_health', async (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// ---------------------------------------------------------------------------
+// ESPN proxy routes (server fetches ESPN, caches, and serves to clients)
+// ---------------------------------------------------------------------------
+
+const ESPN_BASE = 'https://site.api.espn.com/apis/site/v2/sports';
+const ESPN_CORE = 'https://sports.core.api.espn.com/v2/sports';
+
+const LEAGUE_PATHS = {
+  nba: 'basketball/nba',
+  wnba: 'basketball/wnba',
+  ncaam: 'basketball/mens-college-basketball',
+  ncaaw: 'basketball/womens-college-basketball',
+  nfl: 'football/nfl',
+  cfb: 'football/college-football',
+  mlb: 'baseball/mlb',
+  cbb: 'baseball/college-baseball',
+  nhl: 'hockey/nhl',
+};
+
+const LEAGUE_GROUPS = { ncaam: '50', ncaaw: '50', cfb: '80' };
+const VALID_ESPN_LEAGUES = new Set(Object.keys(LEAGUE_PATHS));
+
+// In-memory TTL cache for ESPN responses
+const _espnCache = new Map(); // key -> { data, expiresAt }
+
+function espnCacheGet(key) {
+  const entry = _espnCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _espnCache.delete(key); return null; }
+  return entry.data;
+}
+function espnCacheSet(key, data, ttlSeconds) {
+  _espnCache.set(key, { data, expiresAt: Date.now() + ttlSeconds * 1000 });
+}
+
+// HTTPS GET helper using Node built-in
+function espnFetch(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => (body += chunk));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(body) }); }
+        catch (e) { reject(new Error(`ESPN JSON parse error: ${e.message}`)); }
+      });
+    }).on('error', reject);
+  });
+}
+
+// URL builders
+function espnScoreboardUrl(league, date) {
+  const path = LEAGUE_PATHS[league];
+  const today = date || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const groups = LEAGUE_GROUPS[league] ? `&groups=${LEAGUE_GROUPS[league]}` : '';
+  return `${ESPN_BASE}/${path}/scoreboard?limit=1000&dates=${today}${groups}`;
+}
+function espnSummaryUrl(league, gameId) {
+  return `${ESPN_BASE}/${LEAGUE_PATHS[league]}/summary?event=${gameId}`;
+}
+function espnOddsUrl(league, gameId) {
+  return `${ESPN_BASE}/${LEAGUE_PATHS[league]}/events/${gameId}/odds`;
+}
+function espnTeamScheduleUrl(league, teamId, seasonType) {
+  const qs = seasonType ? `?seasontype=${seasonType}` : '';
+  return `${ESPN_BASE}/${LEAGUE_PATHS[league]}/teams/${teamId}/schedule${qs}`;
+}
+function espnTeamInfoUrl(league, teamId) {
+  const [sport, leagueName] = LEAGUE_PATHS[league].split('/');
+  return `${ESPN_CORE}/${sport}/leagues/${leagueName}/teams/${teamId}`;
+}
+
+// Background polling state
+const _activeLiveGames = {}; // league -> Set<gameId>
+const _liveGameData = {};    // league -> { gameId: summaryJson }
+let _espnPollingActive = false;
+
+function _extractLiveGameIds(scoreboardJson) {
+  const ids = new Set();
+  for (const event of (scoreboardJson.events || [])) {
+    if (event?.status?.type?.state === 'in') ids.add(String(event.id));
+  }
+  return ids;
+}
+
+async function _pollScoreboards() {
+  while (_espnPollingActive) {
+    for (const league of VALID_ESPN_LEAGUES) {
+      try {
+        const { status, data } = await espnFetch(espnScoreboardUrl(league));
+        if (status === 200) {
+          espnCacheSet(`scoreboard:${league}:today`, data, 30);
+          _activeLiveGames[league] = _extractLiveGameIds(data);
+          if (_activeLiveGames[league].size > 0)
+            console.log(`[ESPN] ${league.toUpperCase()}: ${_activeLiveGames[league].size} live games`);
+        }
+      } catch (e) {
+        console.error(`[ESPN] Scoreboard poll error (${league}):`, e.message);
+      }
+    }
+    await new Promise((r) => setTimeout(r, 15000));
+  }
+}
+
+async function _pollLiveGames() {
+  while (_espnPollingActive) {
+    let hasLive = false;
+    for (const [league, gameIds] of Object.entries(_activeLiveGames)) {
+      for (const gameId of [...gameIds]) {
+        hasLive = true;
+        try {
+          const { status, data } = await espnFetch(espnSummaryUrl(league, gameId));
+          if (status === 200) {
+            espnCacheSet(`summary:${league}:${gameId}`, data, 15);
+            (_liveGameData[league] = _liveGameData[league] || {})[gameId] = data;
+            const comp = (data?.header?.competitions || [])[0];
+            if (comp?.status?.type?.completed) {
+              gameIds.delete(gameId);
+              if (_liveGameData[league]) delete _liveGameData[league][gameId];
+            }
+          }
+        } catch (e) {
+          console.error(`[ESPN] Live poll error (${league}/${gameId}):`, e.message);
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    await new Promise((r) => setTimeout(r, hasLive ? 1000 : 5000));
+  }
+}
+
+// ESPN routes
+app.get('/espn/:league/scoreboard', async (req, res) => {
+  const { league } = req.params;
+  const { date } = req.query;
+  if (!VALID_ESPN_LEAGUES.has(league)) return res.status(400).json({ error: `Unknown league: ${league}` });
+  const cacheKey = `scoreboard:${league}:${date || 'today'}`;
+  const cached = espnCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const { status, data } = await espnFetch(espnScoreboardUrl(league, date));
+    if (status !== 200) return res.status(status).json({ error: 'ESPN API error' });
+    espnCacheSet(cacheKey, data, 10);
+    res.json(data);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get('/espn/:league/games/:gameId/summary', async (req, res) => {
+  const { league, gameId } = req.params;
+  if (!VALID_ESPN_LEAGUES.has(league)) return res.status(400).json({ error: `Unknown league: ${league}` });
+  const cacheKey = `summary:${league}:${gameId}`;
+  const cached = espnCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const { status, data } = await espnFetch(espnSummaryUrl(league, gameId));
+    if (status !== 200) return res.status(status).json({ error: 'ESPN API error' });
+    espnCacheSet(cacheKey, data, 5);
+    res.json(data);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get('/espn/:league/games/:gameId/odds', async (req, res) => {
+  const { league, gameId } = req.params;
+  if (!VALID_ESPN_LEAGUES.has(league)) return res.status(400).json({ error: `Unknown league: ${league}` });
+  const cacheKey = `odds:${league}:${gameId}`;
+  const cached = espnCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const { status, data } = await espnFetch(espnOddsUrl(league, gameId));
+    if (status !== 200) return res.status(status).json({ error: 'ESPN API error' });
+    espnCacheSet(cacheKey, data, 30);
+    res.json(data);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get('/espn/:league/teams/:teamId/schedule', async (req, res) => {
+  const { league, teamId } = req.params;
+  const { seasontype } = req.query;
+  if (!VALID_ESPN_LEAGUES.has(league)) return res.status(400).json({ error: `Unknown league: ${league}` });
+  const cacheKey = `schedule:${league}:${teamId}:${seasontype || 'null'}`;
+  const cached = espnCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const { status, data } = await espnFetch(espnTeamScheduleUrl(league, teamId, seasontype));
+    if (status !== 200) return res.status(status).json({ error: 'ESPN API error' });
+    espnCacheSet(cacheKey, data, 1800);
+    res.json(data);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get('/espn/:league/teams/:teamId', async (req, res) => {
+  const { league, teamId } = req.params;
+  if (!VALID_ESPN_LEAGUES.has(league)) return res.status(400).json({ error: `Unknown league: ${league}` });
+  const cacheKey = `team:${league}:${teamId}`;
+  const cached = espnCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const { status, data } = await espnFetch(espnTeamInfoUrl(league, teamId));
+    if (status !== 200) return res.status(status).json({ error: 'ESPN API error' });
+    espnCacheSet(cacheKey, data, 3600);
+    res.json(data);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get('/espn/:league/stream', (req, res) => {
+  const { league } = req.params;
+  if (!VALID_ESPN_LEAGUES.has(league)) return res.status(400).json({ error: `Unknown league: ${league}` });
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  let lastHash = '';
+  const interval = setInterval(() => {
+    const games = Object.values(_liveGameData[league] || {});
+    if (games.length > 0) {
+      const payload = JSON.stringify({ games });
+      const hash = crypto.createHash('md5').update(payload).digest('hex');
+      if (hash !== lastHash) { res.write(`data: ${payload}\n\n`); lastHash = hash; }
+    } else {
+      res.write(': heartbeat\n\n');
+    }
+  }, 3000);
+  req.on('close', () => clearInterval(interval));
+});
+
 (async () => {
+  // Run database migrations before starting the server
+  try {
+    const path = require('path');
+    const migrationDir = path.join(__dirname, '..', 'migrations');
+    const migrationFiles = fs.readdirSync(migrationDir)
+      .filter((f) => f.endsWith('.sql'))
+      .sort();
+    const migrClient = await db.getClient();
+    try {
+      for (const file of migrationFiles) {
+        const sql = fs.readFileSync(path.join(migrationDir, file), 'utf8');
+        await migrClient.query(sql);
+        console.log(`[migration] Applied: ${file}`);
+      }
+    } finally {
+      migrClient.release();
+    }
+    console.log('[migration] All migrations applied');
+  } catch (e) {
+    console.error('[migration] Failed (continuing anyway):', e.message);
+  }
+
   const sslCert = process.env.SSL_CERT_PATH;
   const sslKey = process.env.SSL_KEY_PATH;
   const port = process.env.PORT || 8081;
@@ -812,9 +1060,10 @@ app.get('/_health', async (req, res) => {
     }
     console.log('');
     console.log('Endpoints:');
-    console.log('  POST /sync        - Main sync');
-    console.log('  POST /sync/batch  - Batch sync');
-    console.log('  GET  /health      - Health check');
+    console.log('  POST /sync              - Main sync');
+    console.log('  POST /sync/batch        - Batch sync');
+    console.log('  GET  /health            - Health check');
+    console.log('  GET  /espn/:league/...  - ESPN proxy');
     console.log('');
     console.log('Data is PERSISTENT (stored in PostgreSQL)');
     console.log('');
@@ -831,6 +1080,10 @@ app.get('/_health', async (req, res) => {
       const httpsServer = https.createServer({ key, cert }, app);
       httpsServer.listen(port, host, async () => {
         await printStartupInfo(`https://${host === '0.0.0.0' ? 'localhost' : host}:${port}`);
+        _espnPollingActive = true;
+        _pollScoreboards().catch((e) => console.error('[ESPN] Scoreboard polling stopped:', e.message));
+        _pollLiveGames().catch((e) => console.error('[ESPN] Live game polling stopped:', e.message));
+        console.log('[ESPN] Background polling started');
       });
       return;
     } catch (e) {
@@ -841,6 +1094,10 @@ app.get('/_health', async (req, res) => {
   // Fall back to HTTP
   app.listen(port, host, async () => {
     await printStartupInfo(`http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`);
+    _espnPollingActive = true;
+    _pollScoreboards().catch((e) => console.error('[ESPN] Scoreboard polling stopped:', e.message));
+    _pollLiveGames().catch((e) => console.error('[ESPN] Live game polling stopped:', e.message));
+    console.log('[ESPN] Background polling started');
   });
 })();
 

@@ -4,7 +4,15 @@ let pool = null;
 let connectionTested = false;
 let connectionError = null;
 
-const dbUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/elite_bet_sync';
+const dbUrl = process.env.DATABASE_URL || (() => {
+  const host = process.env.DB_HOST;
+  const port = process.env.DB_PORT || '5432';
+  const user = process.env.DB_USER || 'postgres';
+  const pass = process.env.DB_PASSWORD || 'postgres';
+  const name = process.env.DB_NAME || 'elite_bet_sync';
+  if (host) return `postgresql://${user}:${encodeURIComponent(pass)}@${host}:${port}/${name}`;
+  return 'postgresql://postgres:postgres@localhost:5432/elite_bet_sync';
+})();
 
 try {
   pool = new Pool({
@@ -13,6 +21,10 @@ try {
     max: 10,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
+    // AWS RDS uses its own CA — disable cert verification for intra-VPC connections
+    ssl: dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1')
+      ? false
+      : { rejectUnauthorized: false },
   });
 
   // Log connection attempt
