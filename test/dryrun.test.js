@@ -55,6 +55,7 @@ describe('Dry-run endpoint', () => {
 
     const res = await request(app)
       .post('/sync/dryrun')
+      .set('Authorization', 'Bearer test-token')
       .send({ changes: [oldUpdate] })
       .expect(200);
     expect(res.body.results[0].would_apply).toBe(false);

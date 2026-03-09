@@ -62,6 +62,7 @@ describe('Conflict resolution', () => {
 
     const res2 = await request(app)
       .post('/sync')
+      .set('Authorization', 'Bearer test-token')
       .send({ device_id: 'test', last_server_seq: 0, changes: [change2] })
       .expect(200);
     expect(res2.body.applied).toContain(change2.change_id);
@@ -94,6 +95,7 @@ describe('Conflict resolution', () => {
 
     await request(app)
       .post('/sync')
+      .set('Authorization', 'Bearer test-token')
       .send({ device_id: 'test', last_server_seq: 0, changes: [changeInsert] })
       .expect(200);
 

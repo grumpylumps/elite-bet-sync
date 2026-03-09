@@ -37,6 +37,7 @@ jobs:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: elite_bet_sync
+      PORT: "0"
 
     steps:
       - uses: actions/checkout@v4

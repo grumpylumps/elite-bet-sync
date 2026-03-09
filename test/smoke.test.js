@@ -12,7 +12,11 @@ describe('Smoke: server + DB integration', () => {
   });
 
   test('CORS preflight returns CORS headers', async () => {
-    const res = await request(app).options('/sync').expect(204);
+    const res = await request(app)
+      .options('/sync')
+      .set('Origin', 'https://elitestatsbets.com')
+      .set('Access-Control-Request-Method', 'POST')
+      .expect(204);
     expect(res.headers['access-control-allow-origin']).toBeDefined();
     expect(res.headers['access-control-allow-methods']).toBeDefined();
   });
