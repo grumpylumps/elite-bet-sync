@@ -37,7 +37,6 @@ jobs:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: elite_bet_sync
-      SYNC_API_TOKEN: test-token
 
     steps:
       - uses: actions/checkout@v4
