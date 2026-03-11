@@ -890,13 +890,26 @@ function espnCacheSet(key, data, ttlSeconds) {
 // HTTPS GET helper using Node built-in
 function espnFetch(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      let body = '';
-      res.on('data', (chunk) => (body += chunk));
-      res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(body) }); }
-        catch (e) { reject(new Error(`ESPN JSON parse error: ${e.message}`)); }
+    const opts = { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip, deflate' } };
+    https.get(url, opts, (res) => {
+      const encoding = (res.headers['content-encoding'] || '').toLowerCase();
+      let stream = res;
+      if (encoding === 'gzip') {
+        const zlib = require('zlib');
+        stream = res.pipe(zlib.createGunzip());
+      } else if (encoding === 'deflate') {
+        const zlib = require('zlib');
+        stream = res.pipe(zlib.createInflate());
+      }
+      const chunks = [];
+      stream.on('data', (chunk) => chunks.push(chunk));
+      stream.on('end', () => {
+        try {
+          const body = Buffer.concat(chunks).toString('utf8');
+          resolve({ status: res.statusCode, data: JSON.parse(body) });
+        } catch (e) { reject(new Error(`ESPN JSON parse error: ${e.message}`)); }
       });
+      stream.on('error', reject);
     }).on('error', reject);
   });
 }
