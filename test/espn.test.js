@@ -11,9 +11,10 @@ function mockEspnResponse(data, statusCode = 200) {
   return jest.spyOn(https, 'get').mockImplementation((url, options, callback) => {
     const res = new EventEmitter();
     res.statusCode = statusCode;
+    res.headers = {};
     setImmediate(() => {
       callback(res);
-      res.emit('data', JSON.stringify(data));
+      res.emit('data', Buffer.from(JSON.stringify(data)));
       res.emit('end');
     });
     // espnFetch calls `.on('error', reject)` on the returned request object
