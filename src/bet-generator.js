@@ -164,6 +164,16 @@ const MODEL_PARAMS = {
 // ---------------------------------------------------------------------------
 const _firedTriggers = new Map();
 
+// ---------------------------------------------------------------------------
+// Period tracker: { "league_gameId": lastKnownPeriod }
+// Used to detect period transitions for immediate grading.
+// ---------------------------------------------------------------------------
+const _lastKnownPeriod = new Map();
+
+function gamePeriodKey(league, gameId) {
+  return `${league}_${gameId}`;
+}
+
 function triggerKey(league, gameId, period, triggerName) {
   return `${league}_${gameId}_${period}_${triggerName}`;
 }
@@ -563,9 +573,11 @@ async function persistBet(client, betRow) {
 }
 
 // ---------------------------------------------------------------------------
-// Grade completed games: fill in actual period totals and WIN/LOSS/PUSH
+// Grade bets for specific periods using linescores from the ESPN summary.
+// Called both on period transitions (grade the just-completed period) and
+// on game completion (grade any remaining ungraded periods).
 // ---------------------------------------------------------------------------
-async function gradeCompletedGame(league, gameId, summaryJson) {
+async function gradeBets(league, gameId, summaryJson, { periodsToGrade } = {}) {
   const comp = (summaryJson?.header?.competitions || [])[0];
   if (!comp) return;
 
@@ -584,14 +596,23 @@ async function gradeCompletedGame(league, gameId, summaryJson) {
   try {
     client = await db.getClient();
 
-    // Find ungraded bet_logs for this game
-    const ungraded = await client.query(
-      `SELECT id, period, trigger, line, direction
-       FROM bet_logs
-       WHERE league_id = $1 AND game_id = $2 AND result IS NULL`,
-      [league, gameId]
-    );
+    // Find ungraded bet_logs for this game, optionally filtered to specific periods
+    let query, params;
+    if (periodsToGrade && periodsToGrade.length > 0) {
+      const placeholders = periodsToGrade.map((_, i) => `$${i + 3}`).join(',');
+      query = `SELECT id, period, trigger, line, direction
+               FROM bet_logs
+               WHERE league_id = $1 AND game_id = $2 AND result IS NULL
+                 AND period IN (${placeholders})`;
+      params = [league, gameId, ...periodsToGrade];
+    } else {
+      query = `SELECT id, period, trigger, line, direction
+               FROM bet_logs
+               WHERE league_id = $1 AND game_id = $2 AND result IS NULL`;
+      params = [league, gameId];
+    }
 
+    const ungraded = await client.query(query, params);
     if (ungraded.rowCount === 0) return;
 
     await client.query('BEGIN');
@@ -626,7 +647,11 @@ async function gradeCompletedGame(league, gameId, summaryJson) {
           league_id: league, game_id: gameId,
           period: row.period, trigger: row.trigger,
         });
-        const payload = { actual, result, result_logged_at: now };
+        const payload = {
+          league_id: league, game_id: gameId,
+          period: row.period, trigger: row.trigger,
+          actual, result, result_logged_at: now,
+        };
         await client.query(
           `INSERT INTO server_changes (table_name, pk, op, payload, change_id)
            VALUES ('bet_logs', $1, 'UPDATE', $2, $3)`,
@@ -638,7 +663,8 @@ async function gradeCompletedGame(league, gameId, summaryJson) {
 
     await client.query('COMMIT');
     if (gradedCount > 0) {
-      console.log(`[bet-gen] Graded ${gradedCount} bets for ${league}/${gameId}`);
+      const scope = periodsToGrade ? `P${periodsToGrade.join(',')}` : 'all';
+      console.log(`[bet-gen] Graded ${gradedCount} bets for ${league}/${gameId} (${scope})`);
     }
   } catch (e) {
     if (client) try { await client.query('ROLLBACK'); } catch (_) {}
@@ -646,6 +672,13 @@ async function gradeCompletedGame(league, gameId, summaryJson) {
   } finally {
     if (client) try { client.release(); } catch (_) {}
   }
+}
+
+// Convenience wrapper for game completion (grades all remaining ungraded)
+async function gradeCompletedGame(league, gameId, summaryJson) {
+  // Clean up period tracker for this game
+  _lastKnownPeriod.delete(gamePeriodKey(league, gameId));
+  return gradeBets(league, gameId, summaryJson);
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +691,25 @@ async function processLiveGame(league, gameId, summaryJson) {
   const gameState = extractGameState(league, gameId, summaryJson);
   if (!gameState) return;
 
+  // --- Period transition detection: grade completed periods immediately ---
+  const gpKey = gamePeriodKey(league, gameId);
+  const prevPeriod = _lastKnownPeriod.get(gpKey);
+  const currentPeriod = gameState.period;
+
+  if (prevPeriod != null && currentPeriod > prevPeriod) {
+    // Period advanced — grade all periods from prevPeriod back that are ungraded.
+    // Typically just the one that just ended, but handle skips too.
+    const periodsToGrade = [];
+    for (let p = prevPeriod; p < currentPeriod; p++) {
+      periodsToGrade.push(p);
+    }
+    gradeBets(league, gameId, summaryJson, { periodsToGrade }).catch((e) =>
+      console.error(`[bet-gen] Period grade error (${league}/${gameId}):`, e.message)
+    );
+  }
+  _lastKnownPeriod.set(gpKey, currentPeriod);
+
+  // --- Bet generation for current period ---
   const result = generateBet(gameState, cfg);
   if (!result) return;
 
@@ -696,29 +748,8 @@ async function processLiveGame(league, gameId, summaryJson) {
 // Cleanup fired triggers for games that are no longer live
 // ---------------------------------------------------------------------------
 function cleanupFiredTriggers(activeLiveGames) {
-  const activeKeys = new Set();
-  for (const [league, gameIds] of Object.entries(activeLiveGames)) {
-    for (const gid of gameIds) {
-      activeKeys.add(`${league}_${gid}_`);
-    }
-  }
-
+  // Clean up fired triggers for games no longer live
   for (const key of _firedTriggers.keys()) {
-    const prefix = key.substring(0, key.lastIndexOf('_', key.lastIndexOf('_') - 1) + 1);
-    // Check if any active game matches this prefix pattern
-    let stillActive = false;
-    for (const ak of activeKeys) {
-      if (key.startsWith(ak.substring(0, ak.lastIndexOf('_') + 1))) {
-        // Match on league_gameId prefix
-        const parts = key.split('_');
-        const gamePrefix = `${parts[0]}_${parts[1]}_`;
-        for (const ak2 of activeKeys) {
-          if (ak2 === gamePrefix) { stillActive = true; break; }
-        }
-        break;
-      }
-    }
-    // Simpler approach: extract league and gameId from key
     const parts = key.split('_');
     if (parts.length >= 4) {
       const keyLeague = parts[0];
@@ -729,12 +760,22 @@ function cleanupFiredTriggers(activeLiveGames) {
       }
     }
   }
+
+  // Clean up period tracker for games no longer live
+  for (const key of _lastKnownPeriod.keys()) {
+    const [keyLeague, keyGameId] = key.split('_');
+    const gameSet = activeLiveGames[keyLeague];
+    if (!gameSet || !gameSet.has(keyGameId)) {
+      _lastKnownPeriod.delete(key);
+    }
+  }
 }
 
 module.exports = {
   LEAGUE_CONFIGS,
   processLiveGame,
   gradeCompletedGame,
+  gradeBets,
   cleanupFiredTriggers,
   // Exported for testing
   extractGameState,
