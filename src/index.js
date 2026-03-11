@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const https = require('https');
 const db = require('./db');
+const betGen = require('./bet-generator');
 
 const app = express();
 
@@ -983,6 +984,15 @@ async function _pollLiveGames() {
             if (comp?.status?.type?.completed) {
               gameIds.delete(gameId);
               if (_liveGameData[league]) delete _liveGameData[league][gameId];
+              // Grade bets for completed game
+              betGen.gradeCompletedGame(league, gameId, data).catch((e) =>
+                console.error(`[bet-gen] Grade error (${league}/${gameId}):`, e.message)
+              );
+            } else {
+              // Process live game for bet generation
+              betGen.processLiveGame(league, gameId, data).catch((e) =>
+                console.error(`[bet-gen] Process error (${league}/${gameId}):`, e.message)
+              );
             }
           }
         } catch (e) {
@@ -991,6 +1001,8 @@ async function _pollLiveGames() {
         await new Promise((r) => setTimeout(r, 500));
       }
     }
+    // Cleanup fired triggers for games no longer live
+    betGen.cleanupFiredTriggers(_activeLiveGames);
     await new Promise((r) => setTimeout(r, hasLive ? 1000 : 5000));
   }
 }
@@ -1091,7 +1103,7 @@ app.get('/espn/:league/stream', (req, res) => {
   req.on('close', () => clearInterval(interval));
 });
 
-(async () => {
+if (require.main === module) (async () => {
   // Run database migrations before starting the server
   try {
     const path = require('path');
