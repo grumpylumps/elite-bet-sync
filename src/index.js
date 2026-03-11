@@ -776,6 +776,30 @@ app.get('/_health', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Bet logs endpoint — returns system bet log history for a league
+// ---------------------------------------------------------------------------
+app.get('/api/bet-logs/:league', async (req, res) => {
+  const { league } = req.params;
+  const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
+  try {
+    const result = await db.query(
+      `SELECT league_id, game_id, period, trigger, line, proj, edge, probability,
+              direction, captured_at, capture_type, actual, result, result_logged_at,
+              stake, home_team, away_team
+       FROM bet_logs
+       WHERE league_id = $1
+       ORDER BY captured_at DESC
+       LIMIT $2`,
+      [league, limit]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[bet-logs] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch bet logs' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ESPN proxy routes (server fetches ESPN, caches, and serves to clients)
 // ---------------------------------------------------------------------------
 
