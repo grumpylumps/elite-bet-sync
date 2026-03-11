@@ -574,15 +574,39 @@ async function applyChangeWithRules(client, ch) {
   }
 }
 
+const jwt = require('jsonwebtoken');
+
 function requireAuth(req, res, next) {
-  const token = process.env.SYNC_API_TOKEN;
-  // If no token configured, allow anonymous access (dev mode). Otherwise require Bearer token.
-  if (!token) return next();
+  const staticToken = process.env.SYNC_API_TOKEN;
   const auth = req.headers['authorization'];
-  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
   const provided = auth.split(' ')[1];
-  if (provided !== token) return res.status(401).json({ error: 'unauthorized' });
-  return next();
+
+  // If a static token is configured, it takes priority: accept on match,
+  // reject on mismatch (no JWT fallback when static token is active).
+  if (staticToken) {
+    return provided === staticToken
+      ? next()
+      : res.status(401).json({ error: 'unauthorized' });
+  }
+
+  // No static token — validate as a user JWT signed by the auth server.
+  const jwtSecret = process.env.AUTH_JWT_SECRET;
+  if (!jwtSecret) {
+    console.warn('AUTH_JWT_SECRET not set; accepting any Bearer token');
+    return next();
+  }
+
+  try {
+    jwt.verify(provided, jwtSecret);
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
 }
 
 app.post('/sync', requireAuth, async (req, res) => {
