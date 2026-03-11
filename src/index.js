@@ -800,6 +800,35 @@ app.get('/api/bet-logs/:league', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// User bets endpoint — returns a user's personal bet history for a league
+// Requires ?email=user@example.com query param
+// ---------------------------------------------------------------------------
+app.get('/api/user-bets/:league', async (req, res) => {
+  const { league } = req.params;
+  const { email } = req.query;
+  if (!email) {
+    return res.status(400).json({ error: 'email query param required' });
+  }
+  const limit = Math.min(parseInt(req.query.limit) || 500, 2000);
+  try {
+    const result = await db.query(
+      `SELECT uuid, league_id, game_id, period, home_team, away_team,
+              current_total, proj_total, amount, direction, line, clock,
+              bet_type, scope, actual_total, result, profit_loss, created_at, graded_at
+       FROM user_bets
+       WHERE league_id = $1 AND user_email = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [league, email, limit]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[user-bets] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch user bets' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ESPN proxy routes (server fetches ESPN, caches, and serves to clients)
 // ---------------------------------------------------------------------------
 
