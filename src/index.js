@@ -1003,6 +1003,10 @@ async function _pollLiveGames() {
     }
     // Cleanup fired triggers for games no longer live
     betGen.cleanupFiredTriggers(_activeLiveGames);
+
+    // Grade any pending bets whose games have since completed (mirrors Flutter's gradeAllPendingBets)
+    betGen.gradeAllPendingBets((league, gameId) => espnFetch(espnSummaryUrl(league, gameId)))
+      .catch((e) => console.error('[bet-gen] gradeAllPendingBets error:', e.message));
     await new Promise((r) => setTimeout(r, hasLive ? 1000 : 5000));
   }
 }

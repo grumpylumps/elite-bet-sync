@@ -683,6 +683,142 @@ async function gradeCompletedGame(league, gameId, summaryJson) {
 }
 
 // ---------------------------------------------------------------------------
+// gradeAllPendingBets: periodic pass over all ungraded bets across all leagues.
+// Mirrors Flutter's BetGradingService.gradeAllPendingBets():
+//   - Fetches ESPN summary for each game with ungraded bets
+//   - Grades if game is final OR current period > bet period
+//   - Force-grades as LOSS after STALE_BET_DAYS days
+// Called once per poll cycle from index.js.
+// ---------------------------------------------------------------------------
+const STALE_BET_DAYS = 7;
+const _gradingInProgress = new Set(); // prevent concurrent runs per game
+
+// getSummaryFn(league, gameId) -> { status, data } — injected from index.js
+async function gradeAllPendingBets(getSummaryFn) {
+  let client;
+  let ungradedRows;
+  try {
+    client = await db.getClient();
+    const result = await client.query(
+      `SELECT league_id, game_id, period, trigger, proj, direction, captured_at
+       FROM bet_logs
+       WHERE result IS NULL
+       ORDER BY captured_at ASC`
+    );
+    ungradedRows = result.rows;
+  } catch (e) {
+    console.error('[bet-gen] gradeAllPendingBets query error:', e.message);
+    return;
+  } finally {
+    if (client) try { client.release(); } catch (_) {}
+  }
+
+  if (!ungradedRows || ungradedRows.length === 0) return;
+
+  // Group by league+gameId to avoid redundant ESPN fetches
+  const gameMap = new Map(); // "league:gameId" -> [rows]
+  for (const row of ungradedRows) {
+    const key = `${row.league_id}:${row.game_id}`;
+    if (!gameMap.has(key)) gameMap.set(key, []);
+    gameMap.get(key).push(row);
+  }
+
+  const now = Date.now();
+  const staleMs = STALE_BET_DAYS * 24 * 60 * 60 * 1000;
+
+  for (const [key, rows] of gameMap.entries()) {
+    if (_gradingInProgress.has(key)) continue;
+    _gradingInProgress.add(key);
+    try {
+      const { league_id: league, game_id: gameId } = rows[0];
+      let summaryJson = null;
+
+      try {
+        const { status, data } = await getSummaryFn(league, gameId);
+        if (status === 200) summaryJson = data;
+      } catch (e) {
+        // ESPN unavailable — check stale fallback only
+      }
+
+      const comp = (summaryJson?.header?.competitions || [])[0];
+      const isFinal = comp?.status?.type?.completed === true;
+      const currentPeriod = (() => {
+        const pText = comp?.status?.period;
+        return pText ? parseInt(pText, 10) : 0;
+      })();
+
+      // Build period totals from linescores (same as gradeBets)
+      const periodTotals = {};
+      for (const c of (comp?.competitors || [])) {
+        for (let i = 0; i < (c.linescores || []).length; i++) {
+          const val = parseFloat(c.linescores[i]?.displayValue || c.linescores[i]?.value) || 0;
+          periodTotals[i + 1] = (periodTotals[i + 1] || 0) + val;
+        }
+      }
+
+      for (const row of rows) {
+        const betPeriod = row.period;
+        const capturedAt = new Date(row.captured_at).getTime();
+        const isStale = (now - capturedAt) >= staleMs;
+        const periodComplete = isFinal || (currentPeriod > betPeriod);
+
+        let actual = null;
+        let result = null;
+
+        if (periodComplete && periodTotals[betPeriod] != null) {
+          actual = periodTotals[betPeriod];
+          const proj = parseFloat(row.proj);
+          if (!isNaN(proj)) {
+            if (actual === Math.round(proj)) {
+              result = 'PUSH';
+            } else if (row.direction === 'OVER') {
+              result = actual > proj ? 'WIN' : 'LOSS';
+            } else {
+              result = actual < proj ? 'WIN' : 'LOSS';
+            }
+          }
+        } else if (isStale) {
+          // Can't resolve after 7 days — force LOSS (matches Flutter)
+          actual = 0;
+          result = 'LOSS';
+        }
+
+        if (result == null) continue;
+
+        let gradeClient;
+        try {
+          gradeClient = await db.getClient();
+          const resultNow = new Date().toISOString();
+          await gradeClient.query('BEGIN');
+          await gradeClient.query(
+            `UPDATE bet_logs SET actual = $1, result = $2, result_logged_at = $3
+             WHERE league_id = $4 AND game_id = $5 AND period = $6 AND trigger = $7`,
+            [actual, result, resultNow, league, gameId, betPeriod, row.trigger]
+          );
+          const changeId = crypto.randomUUID();
+          const pk = JSON.stringify({ league_id: league, game_id: gameId, period: betPeriod, trigger: row.trigger });
+          const payload = { league_id: league, game_id: gameId, period: betPeriod, trigger: row.trigger, actual, result, result_logged_at: resultNow };
+          await gradeClient.query(
+            `INSERT INTO server_changes (table_name, pk, op, payload, change_id)
+             VALUES ('bet_logs', $1, 'UPDATE', $2, $3)`,
+            [pk, JSON.stringify(payload), changeId]
+          );
+          await gradeClient.query('COMMIT');
+          console.log(`[bet-gen] Pending grade: ${league}/${gameId} P${betPeriod} ${row.trigger} -> ${result} (actual=${actual})`);
+        } catch (e) {
+          if (gradeClient) try { await gradeClient.query('ROLLBACK'); } catch (_) {}
+          console.error(`[bet-gen] Pending grade error (${league}/${gameId}):`, e.message);
+        } finally {
+          if (gradeClient) try { gradeClient.release(); } catch (_) {}
+        }
+      }
+    } finally {
+      _gradingInProgress.delete(key);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main processing function: called from the ESPN poll loop with live game data
 // ---------------------------------------------------------------------------
 async function processLiveGame(league, gameId, summaryJson) {
@@ -777,6 +913,7 @@ module.exports = {
   processLiveGame,
   gradeCompletedGame,
   gradeBets,
+  gradeAllPendingBets,
   cleanupFiredTriggers,
   // Exported for testing
   extractGameState,
