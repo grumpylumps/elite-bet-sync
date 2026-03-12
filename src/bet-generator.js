@@ -600,13 +600,13 @@ async function gradeBets(league, gameId, summaryJson, { periodsToGrade } = {}) {
     let query, params;
     if (periodsToGrade && periodsToGrade.length > 0) {
       const placeholders = periodsToGrade.map((_, i) => `$${i + 3}`).join(',');
-      query = `SELECT id, period, trigger, line, direction
+      query = `SELECT id, period, trigger, proj, direction
                FROM bet_logs
                WHERE league_id = $1 AND game_id = $2 AND result IS NULL
                  AND period IN (${placeholders})`;
       params = [league, gameId, ...periodsToGrade];
     } else {
-      query = `SELECT id, period, trigger, line, direction
+      query = `SELECT id, period, trigger, proj, direction
                FROM bet_logs
                WHERE league_id = $1 AND game_id = $2 AND result IS NULL`;
       params = [league, gameId];
@@ -622,15 +622,16 @@ async function gradeBets(league, gameId, summaryJson, { periodsToGrade } = {}) {
       const actual = periodTotals[row.period];
       if (actual == null) continue;
 
+      // Grade against proj (projected period total), matching Flutter's system bet logic
       let result;
-      if (row.line == null) {
+      if (row.proj == null) {
         result = null;
-      } else if (actual === row.line) {
+      } else if (actual === Math.round(row.proj)) {
         result = 'PUSH';
       } else if (row.direction === 'OVER') {
-        result = actual > row.line ? 'WIN' : 'LOSS';
+        result = actual > row.proj ? 'WIN' : 'LOSS';
       } else {
-        result = actual < row.line ? 'WIN' : 'LOSS';
+        result = actual < row.proj ? 'WIN' : 'LOSS';
       }
 
       if (result) {
