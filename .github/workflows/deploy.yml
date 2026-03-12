@@ -55,23 +55,20 @@ jobs:
 
   deploy:
     name: Deploy to EC2
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ec2]
     needs: test
     if: always() && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
 
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            cd /opt/elite-bet-sync
-            git pull origin main || git pull origin master
-            npm ci --omit=dev
-            DATABASE_URL=postgresql://postgres:postgres@localhost:5432/elite_bet_sync node migrations/run_migrations.js
-            sudo systemctl restart elite-bet-sync
+      - uses: actions/checkout@v4
+
+      - name: Deploy
+        run: |
+          rsync -a --delete --exclude '.git' --exclude '.env' --exclude 'node_modules' $GITHUB_WORKSPACE/ /opt/elite-bet-sync/
+          cd /opt/elite-bet-sync
+          npm ci --omit=dev
+          DATABASE_URL=postgresql://postgres:postgres@localhost:5432/elite_bet_sync node migrations/run_migrations.js
+          sudo systemctl restart elite-bet-sync
 
       - name: Verify health
         run: |
