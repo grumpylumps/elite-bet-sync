@@ -640,6 +640,19 @@ app.post('/sync', requireAuth, async (req, res) => {
       }
     }
 
+    // Track device last-seen (fire-and-forget, non-blocking)
+    if (device_id) {
+      client.query(
+        `INSERT INTO device_sessions (device_id, last_seen_at, last_server_seq, ip)
+         VALUES ($1, NOW(), $2, $3)
+         ON CONFLICT (device_id) DO UPDATE
+           SET last_seen_at = NOW(),
+               last_server_seq = EXCLUDED.last_server_seq,
+               ip = EXCLUDED.ip`,
+        [device_id, last_server_seq, req.ip]
+      ).catch(() => {}); // ignore errors — this is observability only
+    }
+
     // fetch server changes since last_server_seq (paginated)
     const pullLimit = Math.min(Math.max(parseInt(req.body.pull_limit) || 500, 1), 50000);
     const srv = await client.query(
