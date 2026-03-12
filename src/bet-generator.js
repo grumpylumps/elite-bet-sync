@@ -778,9 +778,22 @@ async function gradeAllPendingBets(getSummaryFn) {
             }
           }
         } else if (isStale) {
-          // Can't resolve after 7 days — force LOSS (matches Flutter)
-          actual = 0;
-          result = 'LOSS';
+          // Can't resolve after 7 days — delete so it doesn't corrupt
+          // win rate stats or ML training data
+          let delClient;
+          try {
+            delClient = await db.getClient();
+            await delClient.query(
+              `DELETE FROM bet_logs WHERE league_id = $1 AND game_id = $2 AND period = $3 AND trigger = $4`,
+              [league, gameId, betPeriod, row.trigger]
+            );
+            console.log(`[bet-gen] Deleted stale unresolvable bet: ${league}/${gameId} P${betPeriod} ${row.trigger}`);
+          } catch (e) {
+            console.error(`[bet-gen] Stale delete error (${league}/${gameId}):`, e.message);
+          } finally {
+            if (delClient) try { delClient.release(); } catch (_) {}
+          }
+          continue;
         }
 
         if (result == null) continue;
