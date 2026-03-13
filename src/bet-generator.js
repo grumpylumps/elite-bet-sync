@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const db = require('./db');
+const mlInference = require('./ml-inference');
 
 // ---------------------------------------------------------------------------
 // League configurations (mirrored from Flutter league_configs.dart)
@@ -412,7 +413,7 @@ function extractGameState(league, gameId, summaryJson) {
 // ---------------------------------------------------------------------------
 // Core bet generation logic (mirrors Flutter game_sync_service.dart)
 // ---------------------------------------------------------------------------
-function generateBet(gameState, leagueConfig) {
+async function generateBet(gameState, leagueConfig) {
   const {
     league, gameId, period, secondsLeft, currentPeriodScore,
     totalLine, homeTeam, awayTeam, isTopInning,
@@ -460,8 +461,8 @@ function generateBet(gameState, leagueConfig) {
     periodLine = currentPeriodScore + triggerAdd;
   }
 
-  // Project period total
-  const periodProj = projectPeriodTotal({
+  // Project period total — try ML first, blend with heuristic fallback
+  const heuristicProj = projectPeriodTotal({
     currentTotal: currentPeriodScore,
     secondsLeft,
     periodLength,
@@ -471,6 +472,30 @@ function generateBet(gameState, leagueConfig) {
     period,
     maxScore: leagueConfig.maxPeriodScore,
   });
+
+  let periodProj = heuristicProj;
+  let mlFeatures = null;
+  try {
+    const mlResult = await mlInference.mlProjectForBetGen({
+      league, currentTotal: currentPeriodScore, secondsLeft, periodLength, period,
+      homeScore: gameState.homeScore, awayScore: gameState.awayScore, totalLine,
+    });
+    if (mlResult != null) {
+      const mlProj = mlResult.prediction;
+      mlFeatures = mlResult.features;
+      // Blend ML with heuristic — ML weighted more early, heuristic more late
+      const elapsed = periodLength > 0 ? (periodLength - secondsLeft) / periodLength : 0;
+      let mlWeight;
+      if (elapsed < 0.25) mlWeight = 0.7;
+      else if (elapsed < 0.50) mlWeight = 0.5;
+      else if (elapsed < 0.75) mlWeight = 0.3;
+      else mlWeight = 0.15;
+      periodProj = mlProj * mlWeight + heuristicProj * (1 - mlWeight);
+      periodProj = Math.max(currentPeriodScore, periodProj);
+    }
+  } catch (_) {
+    // ML unavailable, use heuristic only
+  }
 
   // Basketball trigger floor: if proj < line, clamp up to line
   let adjustedProj = periodProj;
@@ -513,6 +538,7 @@ function generateBet(gameState, leagueConfig) {
     stake: 100,
     home_team: homeTeam,
     away_team: awayTeam,
+    features: mlFeatures,
   };
 
   // Check for BEST window (basketball only, 6:00-3:30)
@@ -539,20 +565,22 @@ async function persistBet(client, betRow) {
     league_id, game_id, period, trigger, line, proj, edge,
     probability, direction, captured_at, capture_type,
     actual, result, result_logged_at, stake, home_team, away_team,
+    features,
   } = betRow;
 
   // Upsert into bet_logs
   const upsertSql = `
     INSERT INTO bet_logs (league_id, game_id, period, trigger, line, proj, edge,
       probability, direction, captured_at, capture_type, actual, result,
-      result_logged_at, stake, home_team, away_team)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+      result_logged_at, stake, home_team, away_team, features)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
     ON CONFLICT (league_id, game_id, period, trigger) DO NOTHING
   `;
+  const featuresJson = features ? JSON.stringify(features) : null;
   const params = [
     league_id, game_id, period, trigger, line, proj, edge,
     probability, direction, captured_at, capture_type, actual, result,
-    result_logged_at, stake, home_team, away_team,
+    result_logged_at, stake, home_team, away_team, featuresJson,
   ];
 
   const res = await client.query(upsertSql, params);
@@ -860,7 +888,7 @@ async function processLiveGame(league, gameId, summaryJson) {
   _lastKnownPeriod.set(gpKey, currentPeriod);
 
   // --- Bet generation for current period ---
-  const result = generateBet(gameState, cfg);
+  const result = await generateBet(gameState, cfg);
   if (!result) return;
 
   let client;
