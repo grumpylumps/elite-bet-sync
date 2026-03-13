@@ -6,6 +6,7 @@ const fs = require('fs');
 const https = require('https');
 const db = require('./db');
 const betGen = require('./bet-generator');
+const mlInference = require('./ml-inference');
 
 const app = express();
 
@@ -795,8 +796,6 @@ app.post('/sync/batch', requireAuth, async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 8081;
-const host = process.env.HOST || '0.0.0.0';
 // Health endpoint for basic checks
 app.get('/health', async (req, res) => {
   try {
@@ -863,6 +862,55 @@ app.get('/api/user-bets/:league', async (req, res) => {
   } catch (e) {
     console.error('[user-bets] query error:', e.message);
     res.status(500).json({ error: 'Failed to fetch user bets' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ML models endpoint — returns stored model weights for a league
+// ---------------------------------------------------------------------------
+app.get('/api/ml-models/:league', async (req, res) => {
+  const { league } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT model_name AS "modelName", metadata, updated_at
+       FROM ml_models
+       WHERE league_id = $1
+       ORDER BY model_name`,
+      [league]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[ml-models] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch ML models' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ML prediction endpoints — Ridge Regression inference on stored weights
+// ---------------------------------------------------------------------------
+app.post('/predict/ingame', async (req, res) => {
+  try {
+    const result = await mlInference.predictIngame(req.body);
+    if (!result) {
+      return res.status(404).json({ error: 'No ML weights available', used_ml_model: false });
+    }
+    res.json(result);
+  } catch (e) {
+    console.error('[predict/ingame] error:', e.message);
+    res.status(500).json({ error: 'Prediction failed', used_ml_model: false });
+  }
+});
+
+app.post('/predict/pregame', async (req, res) => {
+  try {
+    const result = await mlInference.predictPregame(req.body);
+    if (!result) {
+      return res.status(404).json({ error: 'No ML weights or team data available', used_ml_model: false });
+    }
+    res.json(result);
+  } catch (e) {
+    console.error('[predict/pregame] error:', e.message);
+    res.status(500).json({ error: 'Prediction failed', used_ml_model: false });
   }
 });
 
