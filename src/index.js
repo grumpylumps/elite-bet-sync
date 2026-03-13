@@ -7,6 +7,7 @@ const https = require('https');
 const db = require('./db');
 const betGen = require('./bet-generator');
 const mlInference = require('./ml-inference');
+const mlTraining = require('./ml-training');
 
 const app = express();
 
@@ -939,6 +940,65 @@ app.post('/predict/pregame', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// ML Training admin endpoints
+// ---------------------------------------------------------------------------
+
+const ML_ALL_LEAGUES = ['nba', 'wnba', 'ncaam', 'ncaaw', 'nfl', 'cfb', 'mlb', 'cbb', 'nhl'];
+
+app.post('/admin/train/:league', async (req, res) => {
+  const league = req.params.league;
+  if (!ML_ALL_LEAGUES.includes(league)) {
+    return res.status(400).json({ error: `Unknown league: ${league}` });
+  }
+  try {
+    console.log(`[admin] Training triggered for ${league}`);
+    const results = await mlTraining.trainAll(db, league);
+    res.json({ league, status: 'completed', results });
+  } catch (e) {
+    console.error(`[admin] Training failed for ${league}:`, e.message);
+    res.status(500).json({ error: 'Training failed', message: e.message });
+  }
+});
+
+app.post('/admin/train-all', async (req, res) => {
+  try {
+    console.log('[admin] Full training triggered for all leagues');
+    const results = {};
+    for (const league of ML_ALL_LEAGUES) {
+      try {
+        results[league] = await mlTraining.trainAll(db, league);
+      } catch (e) {
+        console.error(`[admin] Training failed for ${league}:`, e.message);
+        results[league] = { error: e.message };
+      }
+    }
+    res.json({ status: 'completed', results });
+  } catch (e) {
+    console.error('[admin] Full training failed:', e.message);
+    res.status(500).json({ error: 'Training failed', message: e.message });
+  }
+});
+
+app.get('/admin/training-status', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT league_id, model_name, samples_used, metrics, completed_at, status
+       FROM ml_training_runs
+       ORDER BY completed_at DESC
+       LIMIT 100`
+    );
+    res.json({ runs: result.rows });
+  } catch (e) {
+    // If table doesn't exist yet, return empty
+    if (e.message.includes('does not exist')) {
+      return res.json({ runs: [], note: 'ml_training_runs table not yet created; run migration 008' });
+    }
+    console.error('[admin] training-status error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch training status' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ESPN proxy routes (server fetches ESPN, caches, and serves to clients)
 // ---------------------------------------------------------------------------
 
@@ -1275,6 +1335,8 @@ if (require.main === module) (async () => {
         _pollScoreboards().catch((e) => console.error('[ESPN] Scoreboard polling stopped:', e.message));
         _pollLiveGames().catch((e) => console.error('[ESPN] Live game polling stopped:', e.message));
         console.log('[ESPN] Background polling started');
+        mlTraining.scheduleTraining(db, 6);
+        console.log('[ML] Training scheduler started (6h interval)');
       });
       return;
     } catch (e) {
@@ -1289,6 +1351,8 @@ if (require.main === module) (async () => {
     _pollScoreboards().catch((e) => console.error('[ESPN] Scoreboard polling stopped:', e.message));
     _pollLiveGames().catch((e) => console.error('[ESPN] Live game polling stopped:', e.message));
     console.log('[ESPN] Background polling started');
+    mlTraining.scheduleTraining(db, 6);
+    console.log('[ML] Training scheduler started (6h interval)');
   });
 })();
 
