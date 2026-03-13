@@ -748,19 +748,40 @@ async function trainAll(dbConn, leagueId) {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-let _trainingInterval = null;
+let _fastInterval = null;   // hourly: quarter_projection + corrections
+let _slowInterval = null;   // 6-hourly: pregame models (heavier, needs cached_games)
 
 function scheduleTraining(dbConn, intervalHours = 6) {
-  if (_trainingInterval) {
-    clearInterval(_trainingInterval);
-  }
+  if (_fastInterval) clearInterval(_fastInterval);
+  if (_slowInterval) clearInterval(_slowInterval);
 
-  const intervalMs = intervalHours * 60 * 60 * 1000;
+  const fastMs = 1 * 60 * 60 * 1000;          // 1 hour
+  const slowMs = intervalHours * 60 * 60 * 1000; // 6 hours
 
-  console.log(`[ml-train] Scheduling training every ${intervalHours} hours`);
+  console.log(`[ml-train] Scheduling: quarter+corrections every 1h, pregame every ${intervalHours}h`);
 
-  _trainingInterval = setInterval(async () => {
-    console.log('[ml-train] Scheduled training run starting...');
+  // Hourly: lightweight in-game models
+  _fastInterval = setInterval(async () => {
+    console.log('[ml-train] Hourly training (quarter + corrections) starting...');
+    for (const leagueId of ALL_LEAGUES) {
+      try {
+        await trainQuarterProjection(dbConn, leagueId);
+      } catch (e) {
+        console.error(`[ml-train] quarter_projection failed for ${leagueId}:`, e.message);
+      }
+      try {
+        await trainCorrections(dbConn, leagueId);
+      } catch (e) {
+        console.error(`[ml-train] corrections failed for ${leagueId}:`, e.message);
+      }
+    }
+    if (typeof mlInference.clearCache === 'function') mlInference.clearCache();
+    console.log('[ml-train] Hourly training complete.');
+  }, fastMs);
+
+  // 6-hourly: heavier pregame models
+  _slowInterval = setInterval(async () => {
+    console.log('[ml-train] Full training run (including pregame) starting...');
     for (const leagueId of ALL_LEAGUES) {
       try {
         await trainAll(dbConn, leagueId);
@@ -768,11 +789,8 @@ function scheduleTraining(dbConn, intervalHours = 6) {
         console.error(`[ml-train] Scheduled training failed for ${leagueId}:`, e.message);
       }
     }
-    console.log('[ml-train] Scheduled training run complete.');
-  }, intervalMs);
-
-  // Return the interval handle for cleanup
-  return _trainingInterval;
+    console.log('[ml-train] Full training run complete.');
+  }, slowMs);
 }
 
 // ---------------------------------------------------------------------------
