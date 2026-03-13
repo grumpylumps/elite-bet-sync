@@ -606,7 +606,8 @@ function requireAuth(req, res, next) {
   }
 
   try {
-    jwt.verify(provided, jwtSecret);
+    const decoded = jwt.verify(provided, jwtSecret);
+    req.user = { email: decoded.email || '', userId: decoded.sub || '' };
     return next();
   } catch (e) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -657,10 +658,16 @@ app.post('/sync', requireAuth, async (req, res) => {
     }
 
     // fetch server changes since last_server_seq (paginated)
+    // Filter user_bets to only return the authenticated user's bets.
     const pullLimit = Math.min(Math.max(parseInt(req.body.pull_limit) || 500, 1), 50000);
+    const userEmail = req.user?.email || '';
     const srv = await client.query(
-      'SELECT server_seq, table_name, pk, op, payload, change_id FROM server_changes WHERE server_seq > $1 ORDER BY server_seq ASC LIMIT $2',
-      [last_server_seq, pullLimit]
+      `SELECT server_seq, table_name, pk, op, payload, change_id
+       FROM server_changes
+       WHERE server_seq > $1
+         AND (table_name != 'user_bets' OR payload->>'user_email' = $3 OR payload->>'user_email' IS NULL)
+       ORDER BY server_seq ASC LIMIT $2`,
+      [last_server_seq, pullLimit, userEmail]
     );
     await client.query('COMMIT');
 
