@@ -595,6 +595,45 @@ async function persistBet(client, betRow) {
        VALUES ('bet_logs', $1, 'INSERT', $2, $3)`,
       [pk, JSON.stringify(betRow), changeId]
     );
+
+    // Also write a trigger_alert so the app can pull alerts after crash/restart
+    const isBest = capture_type === 'BEST';
+    const message = `P${period} ${trigger}: ${direction} ${line} (proj ${proj}, ${(probability * 100).toFixed(0)}%)`;
+    const alertPayload = {
+      league_id, game_id, period, trigger,
+      period_target: Math.round(line),
+      projected_period_total: proj,
+      direction, probability,
+      timestamp: captured_at || new Date().toISOString(),
+      message,
+      best_time_json: null,
+      is_best: isBest,
+    };
+    await client.query(
+      `INSERT INTO trigger_alerts (league_id, game_id, period, trigger,
+        period_target, projected_period_total, direction, probability,
+        timestamp, message, best_time_json, is_best)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (league_id, game_id, period, trigger) DO UPDATE SET
+        projected_period_total = EXCLUDED.projected_period_total,
+        probability = EXCLUDED.probability,
+        direction = EXCLUDED.direction,
+        timestamp = EXCLUDED.timestamp,
+        message = EXCLUDED.message,
+        is_best = EXCLUDED.is_best`,
+      [league_id, game_id, period, trigger,
+       Math.round(line), proj, direction, probability,
+       captured_at || new Date().toISOString(), message, null, isBest]
+    );
+    // Write server_change for trigger_alerts so sync clients pick it up
+    const alertChangeId = crypto.randomUUID();
+    const alertPk = JSON.stringify({ league_id, game_id, period, trigger });
+    await client.query(
+      `INSERT INTO server_changes (table_name, pk, op, payload, change_id)
+       VALUES ('trigger_alerts', $1, 'INSERT', $2, $3)`,
+      [alertPk, JSON.stringify(alertPayload), alertChangeId]
+    );
+
     return true;
   }
   return false;
