@@ -250,9 +250,16 @@ function trainRidge(X, y) {
  * Parse a trigger string like "Q2 8:30" or "H1 15:00" or "P3 12:00" into
  * { period, secondsRemaining }.
  */
-function parseTrigger(trigger) {
+function parseTrigger(trigger, rowPeriod) {
   if (!trigger) return null;
-  // Match patterns like Q2 8:30, H1 15:00, P3 12:00, 1Q 8:30, etc.
+  // Try plain MM:SS format first (e.g., "5:00", "3:30") — period comes from row
+  const plainMatch = trigger.match(/^(\d+):(\d+)$/);
+  if (plainMatch) {
+    const minutes = parseInt(plainMatch[1], 10);
+    const seconds = parseInt(plainMatch[2], 10);
+    return { period: rowPeriod || 1, secondsRemaining: minutes * 60 + seconds };
+  }
+  // Also match Q2 8:30, H1 15:00, P3 12:00, 1Q 8:30, etc.
   const match = trigger.match(/(?:[QHP](\d+)|(\d+)[QHP])\s+(\d+):(\d+)/i);
   if (!match) return null;
   const period = parseInt(match[1] || match[2], 10);
@@ -294,7 +301,7 @@ async function trainQuarterProjection(dbConn, leagueId) {
   const y = [];
 
   for (const row of rows) {
-    const parsed = parseTrigger(row.trigger);
+    const parsed = parseTrigger(row.trigger, row.period);
     if (!parsed) continue;
 
     const timeRemainingSec = parsed.secondsRemaining;
@@ -585,7 +592,7 @@ async function trainCorrections(dbConn, leagueId) {
   // Per-trigger corrections
   const byTriggerType = {};
   for (const row of rows) {
-    const parsed = parseTrigger(row.trigger);
+    const parsed = parseTrigger(row.trigger, row.period);
     if (!parsed) continue;
     // Normalize trigger to just the time pattern (e.g., "Q2 8:30" -> "Q2 8:30")
     const triggerKey = row.trigger.trim();
