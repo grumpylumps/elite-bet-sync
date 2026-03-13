@@ -9,6 +9,7 @@ const betGen = require('./bet-generator');
 const mlInference = require('./ml-inference');
 const mlTraining = require('./ml-training');
 const gameCacher = require('./game-cacher');
+const teamStatsBuilder = require('./team-stats-builder');
 
 const app = express();
 
@@ -1037,6 +1038,31 @@ app.get('/admin/game-cache-status', async (req, res) => {
   }
 });
 
+app.post('/admin/rebuild-team-stats', async (req, res) => {
+  try {
+    const total = await teamStatsBuilder.buildAll(db);
+    res.json({ status: 'completed', teams_updated: total });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/admin/team-stats-status', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT league_id, COUNT(*) AS teams, SUM(games_analyzed) AS total_games,
+             ROUND(AVG(ppg)::numeric, 1) AS avg_ppg
+      FROM team_stats
+      GROUP BY league_id
+      ORDER BY league_id
+    `);
+    const total = await db.query('SELECT COUNT(*) AS cnt FROM team_stats');
+    res.json({ total: parseInt(total.rows[0].cnt, 10), breakdown: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // ESPN proxy routes (server fetches ESPN, caches, and serves to clients)
 // ---------------------------------------------------------------------------
@@ -1377,6 +1403,7 @@ if (require.main === module) (async () => {
         mlTraining.scheduleTraining(db, 6);
         console.log('[ML] Training scheduler started (6h interval)');
         gameCacher.startScheduler(db, 1);
+        teamStatsBuilder.startScheduler(db, 1);
       });
       return;
     } catch (e) {
@@ -1394,6 +1421,7 @@ if (require.main === module) (async () => {
     mlTraining.scheduleTraining(db, 6);
     console.log('[ML] Training scheduler started (6h interval)');
     gameCacher.startScheduler(db, 1);
+    teamStatsBuilder.startScheduler(db, 1);
   });
 })();
 
