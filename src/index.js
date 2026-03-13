@@ -813,6 +813,30 @@ app.get('/_health', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// APK download — no auth required
+// ---------------------------------------------------------------------------
+const APK_PATH = require('path').join(__dirname, '..', 'downloads', 'elite-bet.apk');
+
+app.get('/downloads/elite-bet.apk', (req, res) => {
+  if (!fs.existsSync(APK_PATH)) {
+    return res.status(404).json({ error: 'APK not available yet.' });
+  }
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', 'attachment; filename="elite-bet.apk"');
+  fs.createReadStream(APK_PATH).pipe(res);
+});
+
+const CHECKSUM_PATH = APK_PATH + '.sha256';
+
+app.get('/downloads/elite-bet.apk.sha256', (req, res) => {
+  if (!fs.existsSync(CHECKSUM_PATH)) {
+    return res.status(404).json({ error: 'Checksum not available.' });
+  }
+  res.setHeader('Content-Type', 'text/plain');
+  res.send(fs.readFileSync(CHECKSUM_PATH, 'utf8').trim());
+});
+
+// ---------------------------------------------------------------------------
 // Bet logs endpoint — returns system bet log history for a league
 // ---------------------------------------------------------------------------
 app.get('/api/bet-logs/:league', async (req, res) => {
