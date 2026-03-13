@@ -841,7 +841,7 @@ app.get('/downloads/elite-bet.apk.sha256', (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/api/bet-logs/:league', async (req, res) => {
   const { league } = req.params;
-  const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
+  const limit = Math.min(parseInt(req.query.limit) || 100, 5000);
   try {
     const result = await db.query(
       `SELECT league_id, game_id, period, trigger, line, proj, edge, probability,
