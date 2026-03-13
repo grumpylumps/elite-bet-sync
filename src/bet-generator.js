@@ -725,6 +725,21 @@ async function gradeBets(league, gameId, summaryJson, { periodsToGrade } = {}) {
            VALUES ('bet_logs', $1, 'UPDATE', $2, $3)`,
           [pk, JSON.stringify(payload), changeId]
         );
+
+        // Remove graded trigger_alert — period is over, alert no longer relevant
+        await client.query(
+          `DELETE FROM trigger_alerts
+           WHERE league_id = $1 AND game_id = $2 AND period = $3 AND trigger = $4`,
+          [league, gameId, row.period, row.trigger]
+        );
+        // Notify sync clients of the deletion
+        const delChangeId = crypto.randomUUID();
+        await client.query(
+          `INSERT INTO server_changes (table_name, pk, op, payload, change_id)
+           VALUES ('trigger_alerts', $1, 'DELETE', $2, $3)`,
+          [pk, JSON.stringify({ league_id: league, game_id: gameId, period: row.period, trigger: row.trigger }), delChangeId]
+        );
+
         gradedCount++;
       }
     }
