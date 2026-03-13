@@ -8,6 +8,7 @@ const db = require('./db');
 const betGen = require('./bet-generator');
 const mlInference = require('./ml-inference');
 const mlTraining = require('./ml-training');
+const gameCacher = require('./game-cacher');
 
 const app = express();
 
@@ -999,6 +1000,37 @@ app.get('/admin/training-status', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Game cacher admin endpoints
+// ---------------------------------------------------------------------------
+
+app.post('/admin/backfill-games', async (req, res) => {
+  const days = parseInt(req.query.days || '90', 10);
+  try {
+    console.log(`[admin] Game backfill triggered (${days} days)`);
+    const total = await gameCacher.backfill(db, days);
+    res.json({ status: 'completed', days, games_cached: total });
+  } catch (e) {
+    console.error('[admin] Game backfill failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/admin/game-cache-status', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT league_id, status, COUNT(*) AS cnt
+      FROM cached_games
+      GROUP BY league_id, status
+      ORDER BY league_id, status
+    `);
+    const total = await db.query('SELECT COUNT(*) AS cnt FROM cached_games');
+    res.json({ total: parseInt(total.rows[0].cnt, 10), breakdown: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ESPN proxy routes (server fetches ESPN, caches, and serves to clients)
 // ---------------------------------------------------------------------------
 
@@ -1337,6 +1369,7 @@ if (require.main === module) (async () => {
         console.log('[ESPN] Background polling started');
         mlTraining.scheduleTraining(db, 6);
         console.log('[ML] Training scheduler started (6h interval)');
+        gameCacher.startScheduler(db, 1);
       });
       return;
     } catch (e) {
@@ -1353,6 +1386,7 @@ if (require.main === module) (async () => {
     console.log('[ESPN] Background polling started');
     mlTraining.scheduleTraining(db, 6);
     console.log('[ML] Training scheduler started (6h interval)');
+    gameCacher.startScheduler(db, 1);
   });
 })();
 
