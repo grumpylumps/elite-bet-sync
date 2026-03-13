@@ -580,6 +580,33 @@ async function applyChangeWithRules(client, ch) {
 }
 
 const jwt = require('jsonwebtoken');
+const { Pool: PgPool } = require('pg');
+
+// ── Auth-DB connection (read-only, for session-version checks) ──────────
+// Connects to the auth server's database to validate that the JWT's
+// session_version (`sv`) matches the current value on the user row.
+// This enforces single-device login at the sync layer.
+let authDb = null;
+(() => {
+  const host = process.env.AUTH_DB_HOST || process.env.DB_HOST || 'localhost';
+  const port = process.env.AUTH_DB_PORT || process.env.DB_PORT || '5432';
+  const user = process.env.AUTH_DB_USER || process.env.DB_USER || 'postgres';
+  const pass = process.env.AUTH_DB_PASSWORD || process.env.DB_PASSWORD || 'postgres';
+  const name = process.env.AUTH_DB_NAME || 'elite_bet_auth';
+  const url = `postgresql://${user}:${encodeURIComponent(pass)}@${host}:${port}/${name}`;
+  try {
+    authDb = new PgPool({
+      connectionString: url,
+      max: 3,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+      ssl: (host === 'localhost' || host === '127.0.0.1') ? false : { rejectUnauthorized: false },
+    });
+    console.log('[auth-db] Pool created for session-version checks');
+  } catch (e) {
+    console.warn('[auth-db] Failed to create pool:', e.message);
+  }
+})();
 
 function requireAuth(req, res, next) {
   const staticToken = process.env.SYNC_API_TOKEN;
@@ -609,7 +636,33 @@ function requireAuth(req, res, next) {
   try {
     const decoded = jwt.verify(provided, jwtSecret);
     req.user = { email: decoded.email || '', userId: decoded.sub || '' };
-    return next();
+
+    // Validate session_version against the auth DB to enforce single-device
+    // login. If the auth DB is unavailable, allow the request (fail-open for
+    // sync availability — the auth server still enforces on its endpoints).
+    const tokenSv = parseInt(decoded.sv || '0', 10);
+    const userId = decoded.sub;
+    if (authDb && userId) {
+      authDb.query(
+        'SELECT session_version FROM users WHERE id = $1',
+        [userId],
+      ).then(result => {
+        if (result.rows.length === 0) {
+          return res.status(401).json({ error: 'user not found' });
+        }
+        const dbSv = result.rows[0].session_version || 0;
+        if (tokenSv !== dbSv) {
+          return res.status(401).json({ error: 'Session superseded by another login' });
+        }
+        return next();
+      }).catch(err => {
+        // Auth DB query failed — fail-open to preserve sync availability
+        console.warn('[auth-db] session check failed, allowing request:', err.message);
+        return next();
+      });
+    } else {
+      return next();
+    }
   } catch (e) {
     return res.status(401).json({ error: 'unauthorized' });
   }
@@ -1085,8 +1138,9 @@ const LEAGUE_PATHS = {
 const LEAGUE_GROUPS = { ncaam: '50', ncaaw: '50', cfb: '80' };
 const VALID_ESPN_LEAGUES = new Set(Object.keys(LEAGUE_PATHS));
 
-// In-memory TTL cache for ESPN responses
+// In-memory TTL cache for ESPN responses (bounded to prevent leaks)
 const _espnCache = new Map(); // key -> { data, expiresAt }
+const ESPN_CACHE_MAX = 500;
 
 function espnCacheGet(key) {
   const entry = _espnCache.get(key);
@@ -1095,6 +1149,19 @@ function espnCacheGet(key) {
   return entry.data;
 }
 function espnCacheSet(key, data, ttlSeconds) {
+  // Evict expired entries when approaching the limit
+  if (_espnCache.size >= ESPN_CACHE_MAX) {
+    const now = Date.now();
+    for (const [k, v] of _espnCache) {
+      if (now > v.expiresAt) _espnCache.delete(k);
+    }
+    // If still over limit, drop oldest entries
+    if (_espnCache.size >= ESPN_CACHE_MAX) {
+      const excess = _espnCache.size - ESPN_CACHE_MAX + 1;
+      const iter = _espnCache.keys();
+      for (let i = 0; i < excess; i++) _espnCache.delete(iter.next().value);
+    }
+  }
   _espnCache.set(key, { data, expiresAt: Date.now() + ttlSeconds * 1000 });
 }
 
@@ -1317,6 +1384,20 @@ app.get('/espn/:league/stream', (req, res) => {
   req.on('close', () => clearInterval(interval));
 });
 
+// Log memory usage every 5 minutes and sweep expired ESPN cache entries
+function _startMemoryMonitor() {
+  setInterval(() => {
+    const used = process.memoryUsage();
+    const mb = (bytes) => Math.round(bytes / 1024 / 1024);
+    console.log(`[memory] heap=${mb(used.heapUsed)}MB rss=${mb(used.rss)}MB espnCache=${_espnCache.size} liveGames=${Object.values(_liveGameData).reduce((n, g) => n + Object.keys(g).length, 0)}`);
+    // Sweep expired ESPN cache entries proactively
+    const now = Date.now();
+    for (const [k, v] of _espnCache) {
+      if (now > v.expiresAt) _espnCache.delete(k);
+    }
+  }, 5 * 60 * 1000);
+}
+
 if (require.main === module) (async () => {
   // Run database migrations before starting the server
   try {
@@ -1404,6 +1485,7 @@ if (require.main === module) (async () => {
         console.log('[ML] Training scheduler started (6h interval)');
         gameCacher.startScheduler(db, 1);
         teamStatsBuilder.startScheduler(db, 1);
+        _startMemoryMonitor();
       });
       return;
     } catch (e) {
@@ -1422,6 +1504,7 @@ if (require.main === module) (async () => {
     console.log('[ML] Training scheduler started (6h interval)');
     gameCacher.startScheduler(db, 1);
     teamStatsBuilder.startScheduler(db, 1);
+    _startMemoryMonitor();
   });
 })();
 
