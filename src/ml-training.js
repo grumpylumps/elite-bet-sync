@@ -755,14 +755,14 @@ function scheduleTraining(dbConn, intervalHours = 6) {
   if (_fastInterval) clearInterval(_fastInterval);
   if (_slowInterval) clearInterval(_slowInterval);
 
-  const fastMs = 1 * 60 * 60 * 1000;          // 1 hour
+  const fastMs = 15 * 60 * 1000;               // 15 minutes
   const slowMs = intervalHours * 60 * 60 * 1000; // 6 hours
 
-  console.log(`[ml-train] Scheduling: quarter+corrections every 1h, pregame every ${intervalHours}h`);
+  console.log(`[ml-train] Scheduling: quarter+corrections every 15m, pregame every ${intervalHours}h`);
 
   // Hourly: lightweight in-game models
   _fastInterval = setInterval(async () => {
-    console.log('[ml-train] Hourly training (quarter + corrections) starting...');
+    console.log('[ml-train] 15m training (quarter + corrections) starting...');
     for (const leagueId of ALL_LEAGUES) {
       try {
         await trainQuarterProjection(dbConn, leagueId);
@@ -776,7 +776,7 @@ function scheduleTraining(dbConn, intervalHours = 6) {
       }
     }
     if (typeof mlInference.clearCache === 'function') mlInference.clearCache();
-    console.log('[ml-train] Hourly training complete.');
+    console.log('[ml-train] 15m training complete.');
   }, fastMs);
 
   // 6-hourly: heavier pregame models
