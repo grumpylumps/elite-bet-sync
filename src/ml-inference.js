@@ -16,6 +16,7 @@ const db = require('./db');
 // In-memory weight cache: { "league:modelName": { weights: [...], loadedAt } }
 const _modelCache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000; // Refresh weights every 5 minutes
+const MODEL_CACHE_MAX = 100;
 
 // Feature names — MUST match Flutter ml_projection_service.dart featureNames exactly
 const INGAME_FEATURE_NAMES = [
@@ -79,6 +80,13 @@ async function loadWeights(leagueId, modelName) {
     const weights = meta?.weights;
     if (!Array.isArray(weights) || weights.length < 2) return null;
 
+    // Evict stale entries when approaching the limit
+    if (_modelCache.size >= MODEL_CACHE_MAX) {
+      const now = Date.now();
+      for (const [k, v] of _modelCache) {
+        if (now - v.loadedAt >= CACHE_TTL_MS) _modelCache.delete(k);
+      }
+    }
     _modelCache.set(cacheKey, { weights, loadedAt: Date.now() });
     return weights;
   } catch (e) {
