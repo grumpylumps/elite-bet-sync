@@ -272,21 +272,75 @@ function parseTrigger(trigger, rowPeriod) {
 // Quarter Projection Training
 // ---------------------------------------------------------------------------
 
+// League-specific default quarter averages (must match Flutter mlLeagueConfigs)
+const DEFAULT_QUARTER_AVG = {
+  nba: 56.0, wnba: 42.0, ncaam: 70.0, ncaaw: 35.0,
+  nfl: 10.5, cfb: 12.0, mlb: 0.94, cbb: 1.28, nhl: 2.5,
+};
+
+const DEFAULT_PACE = {
+  nba: 100.0, wnba: 95.0, ncaam: 70.0, ncaaw: 70.0,
+  nfl: 1.0, cfb: 1.0, mlb: 4.5, cbb: 5.5, nhl: 2.0,
+};
+
+// Feature names — must match Flutter toFloatList() order EXACTLY (47 features)
+const QUARTER_FEATURE_NAMES = [
+  'current_total', 'time_remaining_pct', 'elapsed_minutes', 'current_ppm',
+  'home_pace', 'away_pace', 'avg_pace',
+  'home_off_eff', 'away_off_eff', 'home_def_eff', 'away_def_eff',
+  'book_quarter_avg', 'quarter_num', 'is_overtime',
+  'score_differential', 'home_q_avg', 'away_q_avg',
+  'game_total_so_far', 'game_ppm', 'is_close_game', 'is_blowout',
+  'home_elo', 'away_elo', 'elo_diff',
+  'fg_pct_game', 'three_pct_game', 'ft_pct_game',
+  'prev_quarter_total', 'q1_total', 'q2_total', 'first_half_total',
+  'home_recent_ppg', 'away_recent_ppg', 'home_recent_opp_ppg', 'away_recent_opp_ppg',
+  'home_form_trend', 'away_form_trend', 'combined_recent_total',
+  'pregame_spread', 'pregame_home_moneyline',
+  'implied_margin', 'estimated_possessions_left', 'implied_by_estimated_current',
+  'home_away_recent_diff', 'score_sign_diff', 'score_time_interaction', 'implied_by_score',
+];
+
 async function trainQuarterProjection(dbConn, leagueId) {
   const tag = `[ml-train] quarter_projection/${leagueId}`;
   console.log(`${tag} Starting...`);
 
   const periodLength = PERIOD_LENGTHS[leagueId] || 720;
   const regularPeriods = REGULAR_PERIODS[leagueId] || 4;
+  const defaultQAvg = DEFAULT_QUARTER_AVG[leagueId] || 56.0;
+  const defaultPace = DEFAULT_PACE[leagueId] || 100.0;
+  const isBaseball = ['mlb', 'cbb'].includes(leagueId);
 
+  // Enriched query: join bet_logs with cached_games, elo_ratings, game_odds, and team_stats
+  // to get real team Elo, scoring patterns, pregame lines, and team PPG per league.
   const result = await dbConn.query(
-    `SELECT * FROM bet_logs
-     WHERE league_id = $1
-       AND actual IS NOT NULL
-       AND proj IS NOT NULL
-       AND line IS NOT NULL
-       AND trigger != 'Best'
-     ORDER BY captured_at DESC
+    `SELECT b.*,
+            cg.home_team_id, cg.away_team_id, cg.home_score, cg.away_score,
+            cg.period_scores,
+            he.elo AS home_elo_real, ae.elo AS away_elo_real,
+            o.total_line AS pregame_total, o.spread_home AS pregame_spread,
+            o.moneyline_home AS pregame_ml_home,
+            hs.ppg AS home_ppg, hs.avg_score_allowed AS home_opp_ppg,
+            a2.ppg AS away_ppg, a2.avg_score_allowed AS away_opp_ppg
+     FROM bet_logs b
+     LEFT JOIN cached_games cg
+       ON b.league_id = cg.league_id AND b.game_id = cg.game_id
+     LEFT JOIN elo_ratings he
+       ON b.league_id = he.league_id AND cg.home_team_id = he.team_id
+     LEFT JOIN elo_ratings ae
+       ON b.league_id = ae.league_id AND cg.away_team_id = ae.team_id
+     LEFT JOIN game_odds o
+       ON b.league_id = o.league_id AND b.game_id = o.game_id
+     LEFT JOIN team_stats hs
+       ON b.league_id = hs.league_id AND cg.home_team_id = hs.team_id
+     LEFT JOIN team_stats a2
+       ON b.league_id = a2.league_id AND cg.away_team_id = a2.team_id
+     WHERE b.league_id = $1
+       AND b.actual IS NOT NULL
+       AND b.proj IS NOT NULL
+       AND b.line IS NOT NULL
+       AND b.trigger != 'Best'
+     ORDER BY b.captured_at DESC
      LIMIT 5000`,
     [leagueId]
   );
@@ -301,6 +355,13 @@ async function trainQuarterProjection(dbConn, leagueId) {
   const y = [];
 
   for (const row of rows) {
+    // If the bet_log has a stored features vector matching current schema, use it directly
+    if (row.features && Array.isArray(row.features) && row.features.length === 47) {
+      X.push(row.features.map(v => v ?? 0));
+      y.push(row.actual);
+      continue;
+    }
+
     const parsed = parseTrigger(row.trigger, row.period);
     if (!parsed) continue;
 
@@ -309,32 +370,164 @@ async function trainQuarterProjection(dbConn, leagueId) {
     const elapsedSec = periodLength - timeRemainingSec;
     const elapsedMinutes = Math.max(0, elapsedSec) / 60.0;
 
-    // Estimate current total from proj and time remaining
-    const currentTotal = (row.proj || 0) * (1 - timeRemainingPct) * 0.9;
+    // Estimate period current total from projection and time elapsed
+    const currentTotal = Math.max(0, (row.proj || 0) * (1 - timeRemainingPct) * 0.9);
     const currentPpm = elapsedMinutes > 0.5 ? currentTotal / elapsedMinutes : 0;
+
+    // Pace (default per league — real pace not stored in bet_logs)
+    const homePace = defaultPace;
+    const awayPace = defaultPace;
+    const avgPace = defaultPace;
+
+    // Efficiency defaults (not available in historical data)
+    const homeOffEff = 110.0;
+    const awayOffEff = 110.0;
+    const homeDefEff = 110.0;
+    const awayDefEff = 110.0;
 
     const bookQuarterAvg = row.line || 0;
     const quarterNum = row.period || parsed.period || 1;
     const isOvertime = quarterNum > regularPeriods ? 1 : 0;
 
-    // Default stats not available from bet_logs
-    const homeElo = 1500;
-    const awayElo = 1500;
-    const pace = 100;
+    // Score differential from cached_games
+    const hasScores = row.home_score != null && row.away_score != null;
+    const gameTotal = hasScores ? (row.home_score + row.away_score) : 0;
+    const scoreDiff = hasScores ? Math.abs(row.home_score - row.away_score) : 0;
+    const scoreSignDiff = hasScores ? (row.home_score - row.away_score) : 0;
 
+    // Close game / blowout thresholds scaled by sport
+    const closeThresh = isBaseball ? 2 : 10;
+    const blowoutThresh = isBaseball ? 5 : 20;
+    const isCloseGame = scoreDiff < closeThresh ? 1 : 0;
+    const isBlowout = scoreDiff > blowoutThresh ? 1 : 0;
+
+    // Game pace (total game scoring rate)
+    let minsPlayed;
+    if (quarterNum <= regularPeriods) {
+      minsPlayed = (quarterNum - 1) * (periodLength / 60) + elapsedMinutes;
+    } else {
+      minsPlayed = regularPeriods * (periodLength / 60) + (quarterNum - regularPeriods) * 5 + elapsedMinutes;
+    }
+    const gamePpm = minsPlayed > 0 ? gameTotal / Math.max(minsPlayed, 1) : currentPpm;
+
+    // Real Elo from joined data, fallback to 1500
+    const homeElo = row.home_elo_real != null ? parseFloat(row.home_elo_real) : 1500;
+    const awayElo = row.away_elo_real != null ? parseFloat(row.away_elo_real) : 1500;
+    const eloDiff = homeElo - awayElo;
+
+    // Shooting percentages (not stored — use league defaults)
+    const fgPctGame = isBaseball ? 0.0 : 0.45;
+    const threePctGame = isBaseball ? 0.0 : 0.35;
+    const ftPctGame = isBaseball ? 0.0 : 0.75;
+
+    // Period scoring history from period_scores JSON
+    let prevQuarterTotal = 0;
+    let q1Total = 0;
+    let q2Total = 0;
+    let firstHalfTotal = 0;
+    let homeQAvg = defaultQAvg / 2;
+    let awayQAvg = defaultQAvg / 2;
+    if (row.period_scores) {
+      try {
+        const ps = typeof row.period_scores === 'string'
+          ? JSON.parse(row.period_scores) : row.period_scores;
+        if (ps && ps.home && ps.away) {
+          const numP = Math.min(ps.home.length, ps.away.length);
+          if (numP >= 1) q1Total = (ps.home[0] || 0) + (ps.away[0] || 0);
+          if (numP >= 2) q2Total = (ps.home[1] || 0) + (ps.away[1] || 0);
+          if (numP >= 2) firstHalfTotal = q1Total + q2Total;
+          if (quarterNum > 1 && numP >= quarterNum - 1) {
+            prevQuarterTotal = (ps.home[quarterNum - 2] || 0) + (ps.away[quarterNum - 2] || 0);
+          }
+          // Compute per-team per-period averages
+          let homeTotal = 0, awayTotal = 0;
+          const countP = Math.min(numP, quarterNum - 1);
+          for (let i = 0; i < countP; i++) {
+            homeTotal += ps.home[i] || 0;
+            awayTotal += ps.away[i] || 0;
+          }
+          if (countP > 0) {
+            homeQAvg = homeTotal / countP;
+            awayQAvg = awayTotal / countP;
+          }
+        }
+      } catch (_) { /* ignore parse errors */ }
+    }
+
+    // Recent PPG from team_stats (real per-league data)
+    const defaultPpg = defaultQAvg * regularPeriods;
+    const homeRecentPpg = row.home_ppg != null ? parseFloat(row.home_ppg) : defaultPpg;
+    const awayRecentPpg = row.away_ppg != null ? parseFloat(row.away_ppg) : defaultPpg;
+    const homeRecentOppPpg = row.home_opp_ppg != null ? parseFloat(row.home_opp_ppg) : defaultPpg;
+    const awayRecentOppPpg = row.away_opp_ppg != null ? parseFloat(row.away_opp_ppg) : defaultPpg;
+
+    // Form trend (not available — default to 0)
+    const homeFormTrend = 0.0;
+    const awayFormTrend = 0.0;
+    const combinedRecentTotal = homeRecentPpg + awayRecentPpg;
+
+    // Pregame lines from game_odds
+    const pregameSpread = row.pregame_spread != null ? parseFloat(row.pregame_spread) : 0;
+    const pregameHomeMoneyline = row.pregame_ml_home != null ? parseFloat(row.pregame_ml_home) : 0;
+
+    // Derived features (same formulas as Flutter)
+    const usedPregameQAvg = pregameSpread > 0 ? pregameSpread : bookQuarterAvg;
+    const impliedMargin = usedPregameQAvg - defaultQAvg;
+    const estimatedPossLeft = timeRemainingPct * (avgPace / Math.max(regularPeriods, 1));
+    const impliedByEstCurrent = impliedMargin * currentTotal;
+    const homeAwayRecentDiff = homeRecentPpg - awayRecentPpg;
+    const scoreTimeInteraction = scoreSignDiff * timeRemainingPct;
+    const impliedByScore = impliedMargin * scoreSignDiff;
+
+    // Build 47-feature vector matching Flutter toFloatList() order EXACTLY
     const features = [
-      timeRemainingPct,
-      elapsedMinutes,
-      currentTotal,
-      currentPpm,
-      bookQuarterAvg,
-      quarterNum,
-      isOvertime,
-      homeElo,
-      awayElo,
-      homeElo - awayElo, // elo_diff
-      pace,              // home_pace (default)
-      pace,              // away_pace (default)
+      currentTotal,            // 0:  current_total
+      timeRemainingPct,        // 1:  time_remaining_pct
+      elapsedMinutes,          // 2:  elapsed_minutes
+      currentPpm,              // 3:  current_ppm
+      homePace,                // 4:  home_pace
+      awayPace,                // 5:  away_pace
+      avgPace,                 // 6:  avg_pace
+      homeOffEff,              // 7:  home_off_eff
+      awayOffEff,              // 8:  away_off_eff
+      homeDefEff,              // 9:  home_def_eff
+      awayDefEff,              // 10: away_def_eff
+      bookQuarterAvg,          // 11: book_quarter_avg
+      quarterNum,              // 12: quarter_num
+      isOvertime,              // 13: is_overtime
+      scoreDiff,               // 14: score_differential (absolute)
+      homeQAvg,                // 15: home_q_avg
+      awayQAvg,                // 16: away_q_avg
+      gameTotal,               // 17: game_total_so_far
+      gamePpm,                 // 18: game_ppm
+      isCloseGame,             // 19: is_close_game
+      isBlowout,               // 20: is_blowout
+      homeElo,                 // 21: home_elo
+      awayElo,                 // 22: away_elo
+      eloDiff,                 // 23: elo_diff
+      fgPctGame,               // 24: fg_pct_game
+      threePctGame,            // 25: three_pct_game
+      ftPctGame,               // 26: ft_pct_game
+      prevQuarterTotal,        // 27: prev_quarter_total
+      q1Total,                 // 28: q1_total
+      q2Total,                 // 29: q2_total
+      firstHalfTotal,          // 30: first_half_total
+      homeRecentPpg,           // 31: home_recent_ppg
+      awayRecentPpg,           // 32: away_recent_ppg
+      homeRecentOppPpg,        // 33: home_recent_opp_ppg
+      awayRecentOppPpg,        // 34: away_recent_opp_ppg
+      homeFormTrend,           // 35: home_form_trend
+      awayFormTrend,           // 36: away_form_trend
+      combinedRecentTotal,     // 37: combined_recent_total
+      pregameSpread,           // 38: pregame_spread
+      pregameHomeMoneyline,    // 39: pregame_home_moneyline
+      impliedMargin,           // 40: implied_margin
+      estimatedPossLeft,       // 41: estimated_possessions_left
+      impliedByEstCurrent,     // 42: implied_by_estimated_current
+      homeAwayRecentDiff,      // 43: home_away_recent_diff
+      scoreSignDiff,           // 44: score_sign_diff
+      scoreTimeInteraction,    // 45: score_time_interaction
+      impliedByScore,          // 46: implied_by_score
     ];
 
     X.push(features);
@@ -346,10 +539,9 @@ async function trainQuarterProjection(dbConn, leagueId) {
     return null;
   }
 
-  console.log(`${tag} Training on ${X.length} samples...`);
+  console.log(`${tag} Training on ${X.length} samples (${QUARTER_FEATURE_NAMES.length} features)...`);
   const model = trainRidge(X, y);
 
-  // Save to ml_models
   const metadata = {
     weights: model.weights,
     samples_used: model.samplesUsed,
@@ -357,21 +549,18 @@ async function trainQuarterProjection(dbConn, leagueId) {
     rmse: model.rmse,
     alpha: model.alpha,
     trained_at: new Date().toISOString(),
-    feature_names: [
-      'time_remaining_pct', 'elapsed_minutes', 'current_total', 'current_ppm',
-      'book_quarter_avg', 'quarter_num', 'is_overtime',
-      'home_elo', 'away_elo', 'elo_diff', 'home_pace', 'away_pace',
-    ],
+    feature_names: QUARTER_FEATURE_NAMES,
+    feature_count: QUARTER_FEATURE_NAMES.length,
   };
 
   await saveModel(dbConn, leagueId, 'quarter_projection', metadata, model.samplesUsed, model.mae);
 
   // Log training run
   await logTrainingRun(dbConn, leagueId, 'quarter_projection', model.samplesUsed, {
-    mae: model.mae, rmse: model.rmse, alpha: model.alpha,
+    mae: model.mae, rmse: model.rmse, alpha: model.alpha, features: QUARTER_FEATURE_NAMES.length,
   });
 
-  console.log(`${tag} Done. MAE=${model.mae.toFixed(3)}, RMSE=${model.rmse.toFixed(3)}, alpha=${model.alpha}, samples=${model.samplesUsed}`);
+  console.log(`${tag} Done. MAE=${model.mae.toFixed(3)}, RMSE=${model.rmse.toFixed(3)}, alpha=${model.alpha}, features=${QUARTER_FEATURE_NAMES.length}, samples=${model.samplesUsed}`);
   return model;
 }
 
