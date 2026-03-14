@@ -1288,6 +1288,41 @@ async function _pollLiveGames() {
   }
 }
 
+// Batch game odds from Postgres (fallback when ESPN strips odds for live/final games)
+app.post('/api/game-odds/batch', requireAuth, async (req, res) => {
+  const { league_id, game_ids } = req.body;
+  if (!league_id || !Array.isArray(game_ids) || game_ids.length === 0) {
+    return res.status(400).json({ error: 'league_id and game_ids[] required' });
+  }
+  if (game_ids.length > 50) {
+    return res.status(400).json({ error: 'max 50 game_ids per request' });
+  }
+  try {
+    const placeholders = game_ids.map((_, i) => `$${i + 2}`).join(',');
+    const { rows } = await db.query(
+      `SELECT game_id, total_line, spread_home, spread_away, moneyline_home, moneyline_away, over_odds, under_odds
+       FROM game_odds WHERE league_id=$1 AND game_id IN (${placeholders})`,
+      [league_id, ...game_ids]
+    );
+    const result = {};
+    for (const row of rows) {
+      result[row.game_id] = {
+        total_line: row.total_line != null ? parseFloat(row.total_line) : null,
+        spread_home: row.spread_home,
+        spread_away: row.spread_away,
+        moneyline_home: row.moneyline_home != null ? parseFloat(row.moneyline_home) : null,
+        moneyline_away: row.moneyline_away != null ? parseFloat(row.moneyline_away) : null,
+        over_odds: row.over_odds != null ? parseFloat(row.over_odds) : null,
+        under_odds: row.under_odds != null ? parseFloat(row.under_odds) : null,
+      };
+    }
+    res.json(result);
+  } catch (e) {
+    console.error('[game-odds-batch] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ESPN routes
 app.get('/espn/:league/scoreboard', async (req, res) => {
   const { league } = req.params;
