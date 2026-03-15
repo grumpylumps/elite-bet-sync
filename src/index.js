@@ -905,17 +905,30 @@ app.get('/downloads/elite-bet.apk.sha256', (req, res) => {
 app.get('/api/bet-logs/:league', async (req, res) => {
   const { league } = req.params;
   const limit = Math.min(parseInt(req.query.limit) || 100, 5000);
+  const since = req.query.since; // ISO timestamp — only return rows newer than this
   try {
-    const result = await db.query(
-      `SELECT league_id, game_id, period, trigger, line, proj, edge, probability,
+    let query;
+    let params;
+    if (since) {
+      query = `SELECT league_id, game_id, period, trigger, line, proj, edge, probability,
+              direction, captured_at, capture_type, actual, result, result_logged_at,
+              stake, home_team, away_team
+       FROM bet_logs
+       WHERE league_id = $1 AND captured_at > $2
+       ORDER BY captured_at DESC
+       LIMIT $3`;
+      params = [league, since, limit];
+    } else {
+      query = `SELECT league_id, game_id, period, trigger, line, proj, edge, probability,
               direction, captured_at, capture_type, actual, result, result_logged_at,
               stake, home_team, away_team
        FROM bet_logs
        WHERE league_id = $1
        ORDER BY captured_at DESC
-       LIMIT $2`,
-      [league, limit]
-    );
+       LIMIT $2`;
+      params = [league, limit];
+    }
+    const result = await db.query(query, params);
     res.json(result.rows);
   } catch (e) {
     console.error('[bet-logs] query error:', e.message);
@@ -969,6 +982,26 @@ app.get('/api/ml-models/:league', async (req, res) => {
   } catch (e) {
     console.error('[ml-models] query error:', e.message);
     res.status(500).json({ error: 'Failed to fetch ML models' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Elo ratings endpoint — returns all team Elo ratings for a league
+// ---------------------------------------------------------------------------
+app.get('/api/elo-ratings/:league', async (req, res) => {
+  const { league } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT league_id, team_id, team_name, elo, last_updated
+       FROM elo_ratings
+       WHERE league_id = $1
+       ORDER BY elo DESC`,
+      [league]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[elo-ratings] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch elo ratings' });
   }
 });
 
