@@ -966,6 +966,84 @@ app.get('/api/user-bets/:league', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Create a user bet — inserts a new row into user_bets
+// Requires user_email in the JSON body for ownership
+// ---------------------------------------------------------------------------
+app.post('/api/user-bets', async (req, res) => {
+  const {
+    uuid, league_id, game_id, period, home_team, away_team,
+    current_total, proj_total, amount, direction, line, clock,
+    bet_type, scope, actual_total, result, profit_loss,
+    created_at, graded_at, user_email,
+  } = req.body;
+
+  if (!user_email) {
+    return res.status(400).json({ error: 'user_email is required' });
+  }
+  if (!uuid || !league_id || !game_id || period == null || current_total == null || amount == null || !direction || line == null) {
+    return res.status(400).json({ error: 'Missing required fields: uuid, league_id, game_id, period, current_total, amount, direction, line' });
+  }
+
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO user_bets
+         (uuid, league_id, game_id, period, home_team, away_team,
+          current_total, proj_total, amount, direction, line, clock,
+          bet_type, scope, actual_total, result, profit_loss,
+          created_at, graded_at, user_email)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+       RETURNING *`,
+      [
+        uuid, league_id, game_id, period, home_team || null, away_team || null,
+        current_total, proj_total || null, amount, direction, line, clock || null,
+        bet_type || null, scope || null, actual_total || null, result || null, profit_loss || null,
+        created_at || new Date().toISOString(), graded_at || null, user_email,
+      ]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('[user-bets] insert error:', e.message);
+    if (e.code === '23505') {
+      return res.status(409).json({ error: 'A bet with this UUID already exists' });
+    }
+    res.status(500).json({ error: 'Failed to create user bet' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Grade a user bet — update actual_total, result, profit_loss by UUID
+// Requires user_email in the JSON body for ownership verification
+// ---------------------------------------------------------------------------
+app.patch('/api/user-bets/:uuid/grade', async (req, res) => {
+  const { uuid } = req.params;
+  const { actual_total, result, profit_loss, user_email } = req.body;
+
+  if (!user_email) {
+    return res.status(400).json({ error: 'user_email is required' });
+  }
+  if (actual_total == null || !result || profit_loss == null) {
+    return res.status(400).json({ error: 'Missing required fields: actual_total, result, profit_loss' });
+  }
+
+  try {
+    const { rows, rowCount } = await db.query(
+      `UPDATE user_bets
+       SET actual_total = $1, result = $2, profit_loss = $3, graded_at = now()
+       WHERE uuid = $4 AND user_email = $5
+       RETURNING *`,
+      [actual_total, result, profit_loss, uuid, user_email]
+    );
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'User bet not found or does not belong to this user' });
+    }
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('[user-bets] grade error:', e.message);
+    res.status(500).json({ error: 'Failed to grade user bet' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ML models endpoint — returns stored model weights for a league
 // ---------------------------------------------------------------------------
 app.get('/api/ml-models/:league', async (req, res) => {
