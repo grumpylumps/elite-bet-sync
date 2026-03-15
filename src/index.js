@@ -1084,6 +1084,42 @@ app.get('/api/elo-ratings/:league', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Game odds endpoint — returns odds for all games (or filtered) in a league
+// ---------------------------------------------------------------------------
+app.get('/api/game-odds/:league', async (req, res) => {
+  const { league } = req.params;
+  const gameIdsParam = req.query.game_ids; // optional comma-separated game IDs
+  try {
+    let result;
+    if (gameIdsParam) {
+      const gameIds = gameIdsParam.split(',').map(id => id.trim()).filter(Boolean);
+      result = await db.query(
+        `SELECT league_id, game_id, over_odds, under_odds, total_line, bookmaker,
+                spread_home, spread_away, moneyline_home, moneyline_away, last_updated
+         FROM game_odds
+         WHERE league_id = $1 AND game_id = ANY($2)
+         ORDER BY last_updated DESC`,
+        [league, gameIds]
+      );
+    } else {
+      result = await db.query(
+        `SELECT league_id, game_id, over_odds, under_odds, total_line, bookmaker,
+                spread_home, spread_away, moneyline_home, moneyline_away, last_updated
+         FROM game_odds
+         WHERE league_id = $1
+         ORDER BY last_updated DESC
+         LIMIT 500`,
+        [league]
+      );
+    }
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[game-odds] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch game odds' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ML prediction endpoints — Ridge Regression inference on stored weights
 // ---------------------------------------------------------------------------
 app.post('/predict/ingame', async (req, res) => {
