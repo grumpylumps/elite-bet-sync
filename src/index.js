@@ -1120,6 +1120,109 @@ app.get('/api/game-odds/:league', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// High-confidence picks endpoints
+// ---------------------------------------------------------------------------
+
+app.get('/api/high-confidence-picks/:league', async (req, res) => {
+  const { league } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT id, league_id, game_id, home_team, away_team, pick_type, direction,
+              line, prediction, confidence, edge, game_time, picked_at,
+              result, actual_value, graded_at, model_version
+       FROM high_confidence_picks
+       WHERE league_id = $1
+       ORDER BY picked_at DESC`,
+      [league]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[high-confidence-picks] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch high-confidence picks' });
+  }
+});
+
+app.post('/api/high-confidence-picks', async (req, res) => {
+  const picks = Array.isArray(req.body) ? req.body : [req.body];
+  if (picks.length === 0) {
+    return res.status(400).json({ error: 'At least one pick is required' });
+  }
+
+  let client = null;
+  try {
+    client = await db.getClient();
+    await client.query('BEGIN');
+
+    const inserted = [];
+    for (const pick of picks) {
+      const {
+        league_id, game_id, home_team, away_team, pick_type, direction,
+        line, prediction, confidence, edge, game_time, model_version,
+      } = pick;
+
+      if (!league_id || !game_id || !home_team || !away_team || !pick_type || !direction || prediction == null || confidence == null || !game_time) {
+        await client.query('ROLLBACK');
+        client.release();
+        return res.status(400).json({ error: 'Missing required fields: league_id, game_id, home_team, away_team, pick_type, direction, prediction, confidence, game_time' });
+      }
+
+      const { rows } = await client.query(
+        `INSERT INTO high_confidence_picks
+           (league_id, game_id, home_team, away_team, pick_type, direction,
+            line, prediction, confidence, edge, game_time, model_version)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         ON CONFLICT (league_id, game_id, pick_type) DO NOTHING
+         RETURNING *`,
+        [league_id, game_id, home_team, away_team, pick_type, direction,
+         line != null ? line : null, prediction, confidence, edge != null ? edge : null,
+         game_time, model_version || null]
+      );
+      if (rows.length > 0) {
+        inserted.push(rows[0]);
+      }
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json(inserted);
+  } catch (e) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    }
+    console.error('[high-confidence-picks] insert error:', e.message);
+    res.status(500).json({ error: 'Failed to insert high-confidence picks' });
+  } finally {
+    if (client) {
+      try { client.release(); } catch (_) { /* ignore */ }
+    }
+  }
+});
+
+app.patch('/api/high-confidence-picks/grade', async (req, res) => {
+  const { league_id, game_id, pick_type, result, actual_value } = req.body;
+
+  if (!league_id || !game_id || !pick_type || !result || actual_value == null) {
+    return res.status(400).json({ error: 'Missing required fields: league_id, game_id, pick_type, result, actual_value' });
+  }
+
+  try {
+    const { rows, rowCount } = await db.query(
+      `UPDATE high_confidence_picks
+       SET result = $1, actual_value = $2, graded_at = now()
+       WHERE league_id = $3 AND game_id = $4 AND pick_type = $5
+       RETURNING *`,
+      [result, actual_value, league_id, game_id, pick_type]
+    );
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Pick not found' });
+    }
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('[high-confidence-picks] grade error:', e.message);
+    res.status(500).json({ error: 'Failed to grade high-confidence pick' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ML prediction endpoints — Ridge Regression inference on stored weights
 // ---------------------------------------------------------------------------
 app.post('/predict/ingame', async (req, res) => {
