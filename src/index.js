@@ -1223,6 +1223,90 @@ app.patch('/api/high-confidence-picks/grade', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Game analyses endpoints — historical analysis snapshots per game
+// ---------------------------------------------------------------------------
+
+app.get('/api/game-analyses/:league', async (req, res) => {
+  const { league } = req.params;
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  try {
+    const result = await db.query(
+      `SELECT id, game_id, league_id, away_team_name, home_team_name,
+              away_team_elo, home_team_elo,
+              away_season_wins, away_season_losses, home_season_wins, home_season_losses,
+              away_last5_wins, away_last5_losses, home_last5_wins, home_last5_losses,
+              away_ppg, away_opp_ppg, home_ppg, home_opp_ppg,
+              pred_total_elo, pred_spread, blended_total, period_averages,
+              away_score, home_score, period, clock, game_status, created_at
+       FROM game_analyses
+       WHERE league_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [league, limit]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[game-analyses] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch game analyses' });
+  }
+});
+
+app.post('/api/game-analyses', async (req, res) => {
+  const {
+    game_id, league_id, away_team_name, home_team_name,
+    away_team_elo, home_team_elo,
+    away_season_wins, away_season_losses, home_season_wins, home_season_losses,
+    away_last5_wins, away_last5_losses, home_last5_wins, home_last5_losses,
+    away_ppg, away_opp_ppg, home_ppg, home_opp_ppg,
+    pred_total_elo, pred_spread, blended_total, period_averages,
+    away_score, home_score, period, clock, game_status, created_at,
+  } = req.body;
+
+  if (!game_id || !league_id || !away_team_name || !home_team_name || !game_status) {
+    return res.status(400).json({ error: 'Missing required fields: game_id, league_id, away_team_name, home_team_name, game_status' });
+  }
+
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO game_analyses
+         (game_id, league_id, away_team_name, home_team_name,
+          away_team_elo, home_team_elo,
+          away_season_wins, away_season_losses, home_season_wins, home_season_losses,
+          away_last5_wins, away_last5_losses, home_last5_wins, home_last5_losses,
+          away_ppg, away_opp_ppg, home_ppg, home_opp_ppg,
+          pred_total_elo, pred_spread, blended_total, period_averages,
+          away_score, home_score, period, clock, game_status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+       RETURNING *`,
+      [
+        game_id, league_id, away_team_name, home_team_name,
+        away_team_elo != null ? away_team_elo : null,
+        home_team_elo != null ? home_team_elo : null,
+        away_season_wins || 0, away_season_losses || 0,
+        home_season_wins || 0, home_season_losses || 0,
+        away_last5_wins || 0, away_last5_losses || 0,
+        home_last5_wins || 0, home_last5_losses || 0,
+        away_ppg != null ? away_ppg : null,
+        away_opp_ppg != null ? away_opp_ppg : null,
+        home_ppg != null ? home_ppg : null,
+        home_opp_ppg != null ? home_opp_ppg : null,
+        pred_total_elo != null ? pred_total_elo : null,
+        pred_spread != null ? pred_spread : null,
+        blended_total != null ? blended_total : null,
+        period_averages || null,
+        away_score || 0, home_score || 0, period || 0,
+        clock || null, game_status,
+        created_at || new Date().toISOString(),
+      ]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('[game-analyses] insert error:', e.message);
+    res.status(500).json({ error: 'Failed to create game analysis' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ML prediction endpoints — Ridge Regression inference on stored weights
 // ---------------------------------------------------------------------------
 app.post('/predict/ingame', async (req, res) => {

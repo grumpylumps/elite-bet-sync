@@ -1,0 +1,33 @@
+CREATE TABLE IF NOT EXISTS game_analyses (
+  id SERIAL PRIMARY KEY,
+  game_id TEXT NOT NULL,
+  league_id TEXT NOT NULL,
+  away_team_name TEXT NOT NULL,
+  home_team_name TEXT NOT NULL,
+  away_team_elo DOUBLE PRECISION,
+  home_team_elo DOUBLE PRECISION,
+  away_season_wins INTEGER DEFAULT 0,
+  away_season_losses INTEGER DEFAULT 0,
+  home_season_wins INTEGER DEFAULT 0,
+  home_season_losses INTEGER DEFAULT 0,
+  away_last5_wins INTEGER DEFAULT 0,
+  away_last5_losses INTEGER DEFAULT 0,
+  home_last5_wins INTEGER DEFAULT 0,
+  home_last5_losses INTEGER DEFAULT 0,
+  away_ppg DOUBLE PRECISION,
+  away_opp_ppg DOUBLE PRECISION,
+  home_ppg DOUBLE PRECISION,
+  home_opp_ppg DOUBLE PRECISION,
+  pred_total_elo DOUBLE PRECISION,
+  pred_spread DOUBLE PRECISION,
+  blended_total DOUBLE PRECISION,
+  period_averages TEXT,
+  away_score INTEGER DEFAULT 0,
+  home_score INTEGER DEFAULT 0,
+  period INTEGER DEFAULT 0,
+  clock TEXT,
+  game_status TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_game_analyses_league ON game_analyses(league_id);
+CREATE INDEX IF NOT EXISTS idx_game_analyses_created ON game_analyses(created_at DESC);
