@@ -1307,6 +1307,50 @@ app.post('/api/game-analyses', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// ML model history endpoints — track model training history per league
+// ---------------------------------------------------------------------------
+
+app.get('/api/ml-model-history/:league', async (req, res) => {
+  const { league } = req.params;
+  const limit = Math.min(parseInt(req.query.limit) || 500, 1000);
+  try {
+    const result = await db.query(
+      `SELECT id, league_id, model_name, metadata, trained_at
+       FROM ml_model_history
+       WHERE league_id = $1
+       ORDER BY trained_at DESC
+       LIMIT $2`,
+      [league, limit]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[ml-model-history] query error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch ml model history' });
+  }
+});
+
+app.post('/api/ml-model-history', async (req, res) => {
+  const { league_id, model_name, metadata } = req.body;
+
+  if (!league_id || !model_name) {
+    return res.status(400).json({ error: 'Missing required fields: league_id, model_name' });
+  }
+
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO ml_model_history (league_id, model_name, metadata)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [league_id, model_name, metadata || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('[ml-model-history] insert error:', e.message);
+    res.status(500).json({ error: 'Failed to insert ml model history' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ML prediction endpoints — Ridge Regression inference on stored weights
 // ---------------------------------------------------------------------------
 app.post('/predict/ingame', async (req, res) => {
