@@ -1779,9 +1779,10 @@ app.get('/espn/:league/stream', (req, res) => {
   if (!VALID_ESPN_LEAGUES.has(league)) return res.status(400).json({ error: `Unknown league: ${league}` });
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no',
+    'Alt-Svc': 'clear',
   });
   let lastHash = '';
   const interval = setInterval(() => {
@@ -1796,6 +1797,89 @@ app.get('/espn/:league/stream', (req, res) => {
   }, 3000);
   req.on('close', () => clearInterval(interval));
 });
+
+// ---------------------------------------------------------------------------
+// Background pregame odds fetcher
+// Polls scoreboards for scheduled games, fetches pickcenter from summaries,
+// and upserts into game_odds so clients always have pregame lines.
+// ---------------------------------------------------------------------------
+async function _pollPregameOdds() {
+  const INTERVAL = 5 * 60 * 1000; // every 5 minutes
+  while (_espnPollingActive) {
+    for (const league of VALID_ESPN_LEAGUES) {
+      try {
+        const sbKey = `scoreboard:${league}:today`;
+        let sbData = espnCacheGet(sbKey);
+        if (!sbData) {
+          const { status, data } = await espnFetch(espnScoreboardUrl(league));
+          if (status === 200) { sbData = data; espnCacheSet(sbKey, data, 30); }
+        }
+        if (!sbData || !sbData.events) continue;
+
+        for (const event of sbData.events) {
+          const gameId = String(event.id);
+          // Fetch odds for all games (pre, in, post) that are missing from DB
+          try {
+            const existing = await db.query(
+              'SELECT game_id FROM game_odds WHERE league_id=$1 AND game_id=$2',
+              [league, gameId]
+            );
+            if (existing.rowCount > 0) continue; // already have odds
+
+            // Try scoreboard odds first
+            const comps = event.competitions || [];
+            const sbOdds = (comps[0]?.odds || [])[0];
+            let totalLine = sbOdds?.overUnder ?? null;
+            let spreadHome = sbOdds?.spread ?? null;
+            let moneylineHome = sbOdds?.homeTeamOdds?.moneyLine ?? null;
+            let moneylineAway = sbOdds?.awayTeamOdds?.moneyLine ?? null;
+            let overOdds = null, underOdds = null;
+
+            // If scoreboard has no odds, try game summary pickcenter
+            if (totalLine == null && spreadHome == null) {
+              try {
+                const { status: sStatus, data: sData } = await espnFetch(espnSummaryUrl(league, gameId));
+                if (sStatus === 200 && sData.pickcenter && sData.pickcenter.length > 0) {
+                  const pc = sData.pickcenter[0];
+                  totalLine = pc.overUnder ?? null;
+                  spreadHome = pc.spread ?? null;
+                  moneylineHome = pc.homeTeamOdds?.moneyLine ?? null;
+                  moneylineAway = pc.awayTeamOdds?.moneyLine ?? null;
+                  overOdds = pc.overOdds ?? null;
+                  underOdds = pc.underOdds ?? null;
+                }
+              } catch (_) {}
+              await new Promise(r => setTimeout(r, 200)); // rate limit
+            }
+
+            if (totalLine == null && spreadHome == null && moneylineHome == null) continue;
+
+            await db.query(
+              `INSERT INTO game_odds (league_id, game_id, total_line, spread_home, moneyline_home, moneyline_away, over_odds, under_odds, last_updated)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+               ON CONFLICT (league_id, game_id) DO UPDATE SET
+                 total_line = COALESCE(EXCLUDED.total_line, game_odds.total_line),
+                 spread_home = COALESCE(EXCLUDED.spread_home, game_odds.spread_home),
+                 moneyline_home = COALESCE(EXCLUDED.moneyline_home, game_odds.moneyline_home),
+                 moneyline_away = COALESCE(EXCLUDED.moneyline_away, game_odds.moneyline_away),
+                 over_odds = COALESCE(EXCLUDED.over_odds, game_odds.over_odds),
+                 under_odds = COALESCE(EXCLUDED.under_odds, game_odds.under_odds),
+                 last_updated = NOW()`,
+              [league, gameId, totalLine, spreadHome != null ? String(spreadHome) : null,
+               moneylineHome, moneylineAway, overOdds, underOdds]
+            );
+            console.log(`[odds] Stored pregame odds for ${league}/${gameId}: ou=${totalLine} sp=${spreadHome}`);
+          } catch (e) {
+            // Skip individual game errors
+          }
+        }
+      } catch (e) {
+        console.error(`[odds] Poll error (${league}):`, e.message);
+      }
+    }
+    await new Promise(r => setTimeout(r, INTERVAL));
+  }
+}
 
 // Log memory usage every 5 minutes and sweep expired ESPN cache entries
 function _startMemoryMonitor() {
@@ -1893,6 +1977,7 @@ if (require.main === module) (async () => {
         _espnPollingActive = true;
         _pollScoreboards().catch((e) => console.error('[ESPN] Scoreboard polling stopped:', e.message));
         _pollLiveGames().catch((e) => console.error('[ESPN] Live game polling stopped:', e.message));
+        _pollPregameOdds().catch((e) => console.error('[ESPN] Pregame odds polling stopped:', e.message));
         console.log('[ESPN] Background polling started');
         mlTraining.scheduleTraining(db, 6);
         console.log('[ML] Training scheduler started (6h interval)');
@@ -1912,6 +1997,7 @@ if (require.main === module) (async () => {
     _espnPollingActive = true;
     _pollScoreboards().catch((e) => console.error('[ESPN] Scoreboard polling stopped:', e.message));
     _pollLiveGames().catch((e) => console.error('[ESPN] Live game polling stopped:', e.message));
+    _pollPregameOdds().catch((e) => console.error('[ESPN] Pregame odds polling stopped:', e.message));
     console.log('[ESPN] Background polling started');
     mlTraining.scheduleTraining(db, 6);
     console.log('[ML] Training scheduler started (6h interval)');
